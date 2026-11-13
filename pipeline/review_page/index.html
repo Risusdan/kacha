@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>審閱頁</title>
+<link rel="stylesheet" href="review.css">
+<script type="module" src="review.js"></script>
+</head>
+<body>
+<header class="bar">
+  <span id="project" class="title"></span>
+  <span id="lengths" class="stat"></span>
+  <span id="cuts" class="stat"></span>
+  <span class="spacer"></span>
+  <button id="approve" class="btn primary" type="button" hidden>同意，輸出成品</button>
+</header>
+
+<div id="banner" class="banner" role="alert" hidden></div>
+<div id="notice" class="notice" role="status" hidden></div>
+
+<nav id="nav" class="nav" hidden>
+  <span id="decisions" class="pill"></span>
+  <button id="prev" class="btn" type="button">‹ 上一項</button>
+  <button id="next" class="btn" type="button">下一項 ›</button>
+  <button id="listen" class="pill listen-pill" type="button"></button>
+  <button id="asr" class="pill asr-pill" type="button"></button>
+</nav>
+
+<main id="review" class="main" hidden>
+  <section class="left">
+    <div id="player" class="player">
+      <video id="video" src="media/review.mp4" preload="auto" playsinline></video>
+      <div id="caption" class="caption" aria-hidden="true"></div>
+    </div>
+    <div class="controls">
+      <button id="play" class="btn" type="button">▶ 播放</button>
+      <span id="clock" class="clock"></span>
+      <span class="spacer"></span>
+      <button id="slow" class="btn" type="button" aria-pressed="false">0.5×</button>
+    </div>
+    <div id="track" class="track"><div id="playhead" class="playhead"></div></div>
+    <div class="track-ends"><span id="track-start"></span><span id="track-end"></span></div>
+  </section>
+  <section id="script" class="script">
+    <div id="sentences"></div>
+    <div id="pop" class="pop" hidden></div>
+  </section>
+</main>
+
+<section id="working" class="state-view" hidden>
+  <h2 id="working-step"></h2>
+  <p id="working-count" class="sub"></p>
+</section>
+
+<section id="approved" class="state-view" hidden>
+  <h2>已經在對話裡同意了。輸出的進度請看對話；輸出完成後，這裡會播預覽版。</h2>
+</section>
+
+<section id="done" class="state-view done" hidden>
+  <video id="preview" class="preview" controls playsinline></video>
+  <div class="done-text">
+    <h2>✓ 成品完成</h2>
+    <p>發布用：<span id="final-path" class="path"></span></p>
+    <p id="preview-line">只用來看剪接和字幕：<span id="preview-path" class="path"></span></p>
+    <button id="reveal" class="btn" type="button">打開所在的資料夾</button>
+  </div>
+</section>
+
+<footer id="foot" class="foot" hidden>
+  <span><i class="swatch cut"></i>紅色刪除線：剪掉</span>
+  <span><i class="swatch ask"></i>橘框：要你決定</span>
+  <span><i class="swatch listen"></i>虛線底線：剪接處可能切到字</span>
+  <span><i class="swatch asr"></i>紫底：字幕可能有錯字</span>
+  <span><i class="swatch gone"></i>灰字：拿掉或沒講到</span>
+  <span class="chat">想用講的：回到 Claude 對話說「1:15 那段保留」也可以</span>
+</footer>
+
+<dialog id="confirm" class="dialog">
+  <h3>確定輸出成品？</h3>
+  <div id="confirm-body"></div>
+  <div class="row end">
+    <button id="confirm-back" class="btn" type="button">回去再看看</button>
+    <button id="confirm-go" class="btn primary" type="button">確定，輸出成品</button>
+  </div>
+</dialog>
+</body>
+</html>

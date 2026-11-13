@@ -1,0 +1,5 @@
+# throwaway spike: keep fonts and render outputs out of git
+*.ttf
+renders/
+.time
+.hyperframes/

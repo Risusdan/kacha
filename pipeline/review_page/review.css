@@ -1,0 +1,208 @@
+/* The review page: always light. Colours follow the approved mockup. The captions over the video
+   use the caption font the server sends (font/caption.ttf), at sizes review.js scales to the player. */
+
+:root {
+  color-scheme: light;
+  --bg: #f5f5f7;
+  --card: #ffffff;
+  --line: #d9d9de;
+  --text: #1d1d1f;
+  --sub: #6e6e73;
+  --accent: #0a6cff;
+  --cut: #d93025;
+  --cutbg: #fde7e5;
+  --keep: #1e8e3e;
+  --keepline: #b7dfc3;
+  --ask: #b26a00;
+  --askbg: #fff4e0;
+  --askline: #e0a43a;
+  --listen: #8a5a00;
+  --asr: #5b3fd6;
+  --asrbg: #f1ecff;
+  --gone: #9a9aa0;
+  --now: #e8f0ff;
+}
+
+@font-face {
+  font-family: "ReelCaption";
+  src: url("font/caption.ttf") format("truetype");
+  font-display: block;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  background: #f5f5f7;
+  margin: 0;
+  color: var(--text);
+  font-family: system-ui, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  font-size: 15px;
+}
+
+button { font: inherit; color: inherit; }
+
+.btn {
+  display: inline-block;
+  border-radius: 8px;
+  padding: 5px 11px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  background: #fff;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: #a9c7ff; }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; padding: 7px 14px; font-size: 14px; }
+.btn.on { background: #1d1d1f; color: #fff; border-color: #1d1d1f; }
+.btn.cut-choice { color: var(--cut); border-color: #f3b8b2; }
+.btn.cut-choice.on { background: var(--cut); color: #fff; border-color: var(--cut); }
+.btn.keep-choice { color: var(--keep); border-color: var(--keepline); }
+.btn.keep-choice.on { background: var(--keep); color: #fff; border-color: var(--keep); }
+
+.spacer { flex: 1; }
+
+/* top bar, banner, notice, navigation */
+
+.bar { display: flex; align-items: center; gap: 14px; padding: 10px 16px; background: #fff; border-bottom: 1px solid var(--line); font-size: 14px; }
+.bar .title { font-weight: 700; font-size: 16px; }
+.bar .stat { color: var(--sub); }
+
+.banner { padding: 9px 16px; background: #fde7e5; color: #8c1d14; border-bottom: 1px solid #f3b8b2; font-size: 14px; }
+.notice { position: fixed; left: 50%; top: 56px; transform: translateX(-50%); z-index: 20; padding: 8px 16px; border-radius: 10px;
+          background: #1d1d1f; color: #fff; font-size: 14px; box-shadow: 0 6px 18px rgba(0, 0, 0, .18); max-width: 90vw; }
+.notice.error { background: #8c1d14; }
+
+.nav { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #fffaf0; border-bottom: 1px solid #f3dcae; font-size: 13.5px; flex-wrap: wrap; }
+.pill { border-radius: 12px; padding: 2px 10px; border: 1px solid #f0c27a; background: var(--askbg); color: var(--ask); font-size: 13.5px; }
+button.pill { cursor: pointer; }
+.listen-pill { border-color: #d9d9de; background: #f2f2f5; color: var(--sub); }
+.asr-pill { border-color: #cdbff7; background: var(--asrbg); color: var(--asr); }
+
+/* the main view: the player on the left, the transcript on the right */
+
+.main { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+.left { width: 300px; flex: none; }
+.player { position: relative; width: 100%; aspect-ratio: 9 / 16; background: #000; border-radius: 12px; overflow: hidden; cursor: pointer; }
+.player video { display: block; width: 100%; height: 100%; object-fit: contain; }
+.caption { position: absolute; left: 0; right: 0; top: 0; text-align: center; white-space: nowrap; pointer-events: none;
+           font-family: "ReelCaption", sans-serif; font-weight: normal; font-synthesis: none; line-height: normal;
+           paint-order: stroke fill; }
+.controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--sub); }
+.clock { font-variant-numeric: tabular-nums; }
+
+.track { position: relative; height: 16px; margin-top: 8px; border-radius: 5px; overflow: hidden; border: 1px solid var(--line); cursor: pointer;
+         background: repeating-linear-gradient(45deg, #f6c9c4, #f6c9c4 3px, #fde7e5 3px, #fde7e5 6px); }
+.track .kept { position: absolute; top: 0; bottom: 0; background: #cfe0ff; }
+.track .ask { position: absolute; top: 0; bottom: 0; min-width: 2px; background: #ffd99a; }
+.playhead { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: #1d1d1f; z-index: 1; }
+.track-ends { display: flex; justify-content: space-between; font-size: 11px; color: var(--sub); margin-top: 3px; }
+
+.script { position: relative; flex: 1; min-width: 0; max-height: calc(100vh - 150px); overflow: auto; background: #fff; border: 1px solid var(--line);
+          border-radius: 10px; padding: 14px 18px; font-size: 16px; line-height: 2.15; }
+.sentence { margin: 0 0 6px; padding: 0 28px 0 4px; position: relative; border-radius: 6px; }
+.sentence.now { background: var(--now); }
+.ts { color: #a1a1a6; font-size: 12px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+.w { cursor: pointer; border-radius: 3px; }
+.w:hover { background: #eef3ff; }
+
+.mark { cursor: pointer; border-radius: 4px; padding: 0 2px; }
+.mark.cut { color: var(--cut); background: var(--cutbg); text-decoration: line-through; }
+.mark.kept { border-bottom: 2px solid var(--keepline); }
+.mark.listen { border-bottom: 2px dotted var(--listen); }
+/* the unit nearest a cut point at a sentence's edge: it opens the card of that cut point */
+.w.edge { border-bottom: 2px dotted var(--listen); border-radius: 0; }
+.mark.ask { background: var(--askbg); outline: 1.5px solid var(--askline); outline-offset: 0; padding: 0 3px; }
+.mark.ask.cut { color: var(--cut); }
+.mark.pause { display: inline-block; font-size: 11px; line-height: 18px; padding: 0 5px; vertical-align: middle; text-decoration: none; color: var(--sub); background: #f2f2f5; }
+.mark.pause.cut { color: var(--cut); background: var(--cutbg); }
+.mark.pause.kept { border-bottom: none; }
+.mark:focus-visible, .asr:focus-visible, .w:focus-visible { outline: 2px solid var(--accent); }
+.num { display: inline-block; background: var(--askline); color: #fff; border-radius: 9px; font-size: 11px; line-height: 16px; padding: 0 5px;
+       margin-right: 2px; vertical-align: 1px; text-decoration: none; }
+
+.asr { background: var(--asrbg); border-radius: 4px; padding: 0 2px; cursor: pointer; }
+.gone { color: var(--gone); text-decoration: line-through; }
+.unspoken { color: var(--gone); }
+.tag { font-size: 11px; border: 1px solid #c7c7cc; border-radius: 4px; padding: 0 5px; margin-left: 6px; color: var(--sub); background: #fff;
+       display: inline-block; line-height: 18px; vertical-align: middle; }
+button.tag { cursor: pointer; }
+button.tag:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.why { font-size: 12px; color: var(--sub); margin-left: 6px; }
+.more { position: absolute; right: 2px; top: 0; border: none; background: none; color: #a1a1a6; font-size: 16px; line-height: inherit; cursor: pointer; padding: 0 4px; }
+.more:hover { color: var(--text); }
+
+/* popovers: the card of an item and the ⋯ menu */
+
+.pop { position: absolute; z-index: 5; width: 340px; max-width: calc(100% - 16px); background: #fff; border: 1px solid var(--askline); border-radius: 11px;
+       box-shadow: 0 8px 24px rgba(0, 0, 0, .14); padding: 11px 13px; font-size: 13.5px; line-height: 1.65; }
+.pop.typo { border-color: #b9a8f2; }
+.pop.menu { width: auto; padding: 4px 0; border-color: var(--line); }
+.pop h4 { margin: 0 0 4px; font-size: 14px; }
+.pop .said { margin: 4px 0; }
+.pop .rec { background: #fafafa; border-radius: 7px; padding: 6px 8px; margin: 6px 0; }
+.pop .row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.pop .hint { font-size: 12px; color: var(--sub); margin-top: 6px; }
+.pop.menu button { display: block; width: 100%; text-align: left; border: none; background: none; padding: 7px 16px; font-size: 13px; cursor: pointer; }
+.pop.menu button:hover:not(:disabled) { background: #f2f2f5; }
+.pop.menu button + button { border-top: 1px solid #eee; }
+
+/* the caption editor (mockup caption-edit), in place of a sentence's row, and a sentence whose caption text changed.
+   The field is a text input over a backdrop that holds the same text, invisible, with the changed characters on a
+   green ground: both use the same font, size and padding, and review.js scrolls the backdrop with the input. */
+
+.edit { border: 2px solid var(--accent); border-radius: 11px; padding: 10px 14px; margin: 6px 0 10px; background: #f7faff; line-height: 1.6; font-size: 15px; }
+.edit .lbl { font-size: 12.5px; color: var(--sub); margin: 8px 0 3px; }
+.edit .lbl:first-child { margin-top: 0; }
+.edit .heard { font-size: 14.5px; }
+.field { position: relative; border: 1px solid #9cbcff; border-radius: 8px; background: #fff; }
+.field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px #dbe7ff; }
+.field-marks, .field-input { font-family: inherit; font-size: 16px; font-weight: normal; line-height: 1.6; letter-spacing: normal; padding: 8px 10px; white-space: pre; }
+.field-marks { position: absolute; inset: 0; overflow: hidden; color: transparent; pointer-events: none; }
+.field-marks mark { background: #d7f5df; color: transparent; border-radius: 3px; }
+.field-input { position: relative; display: block; width: 100%; margin: 0; border: none; background: transparent; color: var(--text); outline: none; }
+.lines { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.lines span { background: #2b2b2e; color: #fff; border-radius: 6px; padding: 3px 10px; font-family: "ReelCaption", sans-serif; font-size: 14px; white-space: pre; }
+.lines .error { color: #8c1d14; font-size: 13.5px; }
+.edit .row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.edit .note { font-size: 12.5px; color: var(--sub); margin-top: 8px; }
+.edited { border-bottom: 2px solid #9cdcaf; }
+.edited[data-typo] { cursor: pointer; }
+.edited:focus-visible { outline: 2px solid var(--accent); }
+.tag.edited-tag { border-color: #9cdcaf; color: var(--keep); }
+
+/* the footer */
+
+.foot { font-size: 12.5px; color: var(--sub); padding: 8px 16px; border-top: 1px solid var(--line); background: #fff; display: flex; gap: 18px; flex-wrap: wrap; }
+.foot .chat { margin-left: auto; }
+.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; }
+.swatch.cut { background: var(--cutbg); border: 1px solid #f3b8b2; }
+.swatch.ask { background: var(--askbg); border: 1px solid var(--askline); }
+.swatch.listen { border-bottom: 2px dotted var(--listen); border-radius: 0; height: 8px; }
+.swatch.asr { background: var(--asrbg); }
+.swatch.gone { background: #e5e5ea; }
+
+/* the confirm dialog */
+
+.dialog { width: 520px; max-width: calc(100vw - 32px); border: none; border-radius: 14px; padding: 18px 20px; background: #fff; color: var(--text);
+          box-shadow: 0 12px 40px rgba(0, 0, 0, .25); font-size: 14.5px; line-height: 1.7; }
+.dialog::backdrop { background: rgba(0, 0, 0, .28); }
+.dialog h3 { margin: 0 0 8px; font-size: 17px; }
+.dialog ul { margin: 6px 0 10px; padding-left: 20px; }
+.dialog .warn { background: var(--asrbg); border-radius: 8px; padding: 6px 10px; color: #3d2a99; margin: 6px 0; }
+.dialog p { margin: 4px 0; }
+.row { display: flex; gap: 10px; }
+.row.end { justify-content: flex-end; margin-top: 12px; }
+
+/* the views of a page that changes nothing more: working, approved in the chat, done */
+
+.state-view { max-width: 760px; margin: 48px auto; padding: 24px; background: #fff; border: 1px solid var(--line); border-radius: 12px; line-height: 1.8; }
+.state-view h2 { margin: 0 0 6px; font-size: 19px; }
+.state-view .sub { color: var(--sub); margin: 0; }
+.done { display: flex; gap: 20px; align-items: flex-start; }
+.preview { width: 220px; aspect-ratio: 9 / 16; background: #000; border-radius: 10px; flex: none; }
+.done-text p { margin: 4px 0; font-size: 14px; }
+.path { font-family: ui-monospace, monospace; font-size: 12px; background: #f2f2f5; border-radius: 6px; padding: 2px 8px; word-break: break-all; }
+
+body.busy .pop .row .btn, body.busy .edit .row .btn, body.busy button.tag { cursor: progress; }
