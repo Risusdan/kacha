@@ -11,16 +11,24 @@ a page of another site that reaches the port through a host name of its own (DNS
 Only the fixed routes answer. The path of a request (the part before "?") is looked up as a whole string, and no
 part of it is ever joined to a file path: the page files are those PAGE_FILES names in PAGE_DIR, the font is the
 style's caption font, and the videos are work/review.mp4 and out/preview.mp4, sent with byte ranges (byte_range),
-which a browser needs to seek in a video. Any other path is 404.
+which a browser needs to seek in a video. Any other path is 404. The page's script is four ES modules (review.js,
+which index.html loads, and logic.js, shared.js and editor.js, which it imports by relative URL); a browser asks for
+each of them by the route of its own name, so each is a route in PAGE_FILES.
 
-GET /api/data is review_data.page_data with the state of the page; GET /api/state is {"version", "state", "step",
-"error", "outputs"} (ReviewServer.status). The state is "working" while the approval job runs ("step" is the step it is
-on: "storyboard", "approve" or "render"); "done" when gate 1 is approved for the current storyboard, the render step is
-done and out/final.mp4 is there ("outputs": the paths of final.mp4, of preview.mp4 or None, and of out/); "failed"
-after the job failed ("error": FAILED_TEXT), until a change lands, another approval starts, or a render from the chat
-completes ("done" outranks "failed"); "approved" when gate 1 is approved without the output being done (the user
-approved in the chat, and Claude renders); else "editing". Neither route takes the change lock, so the page can poll
-during a render.
+Reading a request is pipeline.review_requests: the Range header (byte_range), the Cookie headers (cookie_values), the
+Content-Length (content_length) and the JSON body of each POST route (change_request, caption_request,
+approve_request, reveal_request). What it refuses with BadRequest is a 400 here, and a Range with RangeNotSatisfiable
+a 416; the limits on the size of a body (MAX_BODY, DRAIN_CAP) are applied here, where the body is read.
+
+GET /api/data is review_data.page_data with the state of the page (the "state", "step", "error" and "outputs" that
+ReviewServer.state gives, from one reading, so that the page's first view needs no poll to show a step or an error);
+GET /api/state is {"version", "state", "step", "error", "outputs"} (ReviewServer.status). The state is "working" while
+the approval job runs ("step" is the step it is on: "storyboard", "approve" or "render"); "done" when gate 1 is
+approved for the current storyboard, the render step is done and out/final.mp4 is there ("outputs": the paths of
+final.mp4, of preview.mp4 or None, and of out/); "failed" after the job failed ("error": FAILED_TEXT), until a change
+lands, another approval starts, or a render from the chat completes ("done" outranks "failed"); "approved" when gate 1
+is approved without the output being done (the user approved in the chat, and Claude renders); else "editing". Neither
+route takes the change lock, so the page can poll during a render.
 
 POST /api/change hands {"version", "change"} to review_actions.apply_change, one call at a time: 200 {"version"}, 409
 {"error", "conflict": true} when the version is old, 422 {"error"} when the change is refused. POST
@@ -43,7 +51,8 @@ application/json, whose Content-Length is missing or over MAX_BODY, or whose bod
 body over MAX_BODY is read and dropped up to DRAIN_CAP bytes, so that the browser gets the 400 and not a reset
 connection; one declared longer than that is not read at all, and the connection closes after the 400. Once stop()
 has begun, no change is applied and no job starts (403), and stop() returns only after a change being applied is
-written and a job that runs has ended.
+written and a job that runs has ended. The serving loop looks every SERVE_POLL_S seconds whether it should end, so
+stop() waits no longer than that for it.
 
 The server stops itself when no request with the key came for idle_s seconds and no job runs (the end of a job counts
 as a request); wait() then returns "idle". It decides that where changes and approvals decide (under the entry lock)
@@ -57,15 +66,17 @@ did not expect, which is 500). The English of an error goes to work/review.log, 
 the query, so it never holds the key; nothing goes to stderr. Every answer carries Cache-Control: no-store. A
 connection that sends or reads nothing for REQUEST_TIMEOUT_S ends.
 
-The server writes only work/review.log, and through apply_change and the steps what they write. It deletes nothing of
-its own (storyboard and render delete only what they always have, inside the project).
+The server writes only inside the project folder: work/review.log; through apply_change, what it writes
+(edit.json, review-undo.json and, through validate_project and update_state, state.json with its lock file
+work/state.lock); the lock file work/output.lock, which approve() creates (ProjectLock); and through the steps what
+they write. Both lock files are made when missing and never deleted. It deletes nothing of its own (storyboard and
+render delete only what they always have, inside the project).
 """
 
 import datetime
 import hmac
 import json
 import os
-import re
 import secrets
 import shutil
 import subprocess
@@ -88,6 +99,17 @@ from pipeline.project import Project, ProjectBusy, ProjectLock, approve_gate, ed
 from pipeline.render import render
 from pipeline.review_actions import LOG_FILE, ChangeRefused, VersionConflict, apply_change, preview_caption
 from pipeline.review_data import NotReady, edit_version, page_data
+from pipeline.review_requests import (
+    BadRequest,
+    RangeNotSatisfiable,
+    approve_request,
+    byte_range,
+    caption_request,
+    change_request,
+    content_length,
+    cookie_values,
+    reveal_request,
+)
 from pipeline.review_video import make_review_video, review_video_path
 from pipeline.storyboard import NOT_VALIDATED_REFUSAL, OLDER_FILES_REFUSAL, build_storyboard
 from pipeline.style import font_path, load_style
@@ -110,11 +132,16 @@ MAX_BODY = 65536  # the most bytes a POST body may have
 DRAIN_CAP = 4 * 1024 * 1024  # a longer body is read and dropped up to this many bytes; one declared longer is not
 CHUNK = 1 << 16  # files and drained bodies move in pieces of this many bytes
 REQUEST_TIMEOUT_S = 60  # a connection that sends or reads nothing for this long ends
+# serve_forever looks this often whether shutdown() asked it to end, and stop() waits for that look. The standard
+# library's half second would hold up every stop by up to that long; a wake-up every 50 ms costs next to nothing.
+SERVE_POLL_S = 0.05
 JSON_TYPE = "application/json; charset=utf-8"
 PAGE_FILES = {  # route -> (the file in PAGE_DIR, its content type)
     "/": ("index.html", "text/html; charset=utf-8"),
     "/review.js": ("review.js", "text/javascript; charset=utf-8"),
     "/logic.js": ("logic.js", "text/javascript; charset=utf-8"),
+    "/shared.js": ("shared.js", "text/javascript; charset=utf-8"),
+    "/editor.js": ("editor.js", "text/javascript; charset=utf-8"),
     "/review.css": ("review.css", "text/css; charset=utf-8"),
 }
 FONT_ROUTE = "/font/caption.ttf"
@@ -122,16 +149,6 @@ MEDIA_ROUTES = {  # route -> the video of a project it sends
     "/media/review.mp4": review_video_path,
     "/media/preview.mp4": lambda p: p.out / "preview.mp4",
 }
-_RANGE = re.compile(r"bytes=([0-9]{0,20})-([0-9]{0,20})", re.IGNORECASE)
-_LENGTH = re.compile(r"[0-9]{1,20}")
-
-
-class RangeNotSatisfiable(Exception):
-    """A Range header that asks for bytes the file does not have: 416."""
-
-
-class BadRequest(Exception):
-    """A POST the server does not read: 400. The message is English, for work/review.log."""
 
 
 class Refused(Exception):
@@ -170,100 +187,6 @@ def reveal_in_folder(path: Path) -> None:
 def free_gib(p: Project) -> float:
     """The free space on the disk of the project folder, in GiB."""
     return shutil.disk_usage(p.dir).free / 2**30
-
-
-# ---- reading a request ------------------------------------------------------------------------
-
-
-def byte_range(header: str | None, size: int) -> tuple[int, int] | None:
-    """The bytes a Range header asks of a file of `size` bytes: (first, last), both included. One range of the
-    forms bytes=a-b, bytes=a- and bytes=-n is read; an end past the file stops at its last byte, and a suffix longer
-    than the file is all of it. A start at or past the size, or a suffix of 0 bytes, raises RangeNotSatisfiable. No
-    header, or one in any other form (several ranges, another unit, an end before the start), gives None: the whole
-    file is sent, as a server may do with a Range it does not read."""
-    match = _RANGE.fullmatch(header.strip()) if header is not None else None
-    if match is None or match.groups() == ("", ""):
-        return None
-    start, end = match.groups()
-    if start == "":
-        suffix = int(end)
-        if suffix == 0 or size == 0:
-            raise RangeNotSatisfiable(header)
-        return max(0, size - suffix), size - 1
-    first = int(start)
-    if end != "" and int(end) < first:
-        return None
-    if first >= size:
-        raise RangeNotSatisfiable(header)
-    return first, size - 1 if end == "" else min(int(end), size - 1)
-
-
-def cookie_values(headers: list[str], name: str) -> list[str]:
-    """The values of the cookie `name` in the Cookie headers `headers`, in order."""
-    values = []
-    for header in headers:
-        for pair in header.split(";"):
-            key, equals, value = pair.partition("=")
-            if equals and key.strip() == name:
-                values.append(value.strip())
-    return values
-
-
-def content_length(value: str | None) -> int:
-    """The Content-Length header `value` as a number; a missing or unreadable one raises BadRequest."""
-    if value is None or not _LENGTH.fullmatch(value.strip()):
-        raise BadRequest(f"Content-Length is {value!r}, not a number of bytes")
-    return int(value)
-
-
-def _json_body(content_type: str | None, body: bytes) -> object:
-    """The JSON document of a POST body. Raises BadRequest unless the media type of `content_type` (before any ";",
-    in any case) is application/json and `body` is JSON."""
-    media_type = (content_type or "").split(";", 1)[0].strip().lower()
-    if media_type != "application/json":
-        raise BadRequest(f"Content-Type is {content_type!r}, not application/json")
-    try:
-        return json.loads(body)
-    except (ValueError, RecursionError) as error:
-        raise BadRequest(f"the body is not JSON: {type(error).__name__}: {error}") from None
-
-
-def change_request(content_type: str | None, body: bytes) -> tuple[str, dict]:
-    """(version, change) of the body of POST /api/change. Raises BadRequest unless the media type of
-    `content_type` (before any ";", in any case) is application/json and `body` is a JSON object with a string
-    "version" and an object "change"."""
-    document = _json_body(content_type, body)
-    if not (isinstance(document, dict) and isinstance(document.get("version"), str)
-            and isinstance(document.get("change"), dict)):
-        raise BadRequest('the body is not {"version": string, "change": object}')
-    return document["version"], document["change"]
-
-
-def caption_request(content_type: str | None, body: bytes) -> tuple[str, str]:
-    """(sentence, text) of the body of POST /api/caption-lines, read as change_request reads its body: a JSON object
-    with a string "sentence" and a string "text"."""
-    document = _json_body(content_type, body)
-    if not (isinstance(document, dict) and isinstance(document.get("sentence"), str)
-            and isinstance(document.get("text"), str)):
-        raise BadRequest('the body is not {"sentence": string, "text": string}')
-    return document["sentence"], document["text"]
-
-
-def approve_request(content_type: str | None, body: bytes) -> str:
-    """The version of the body of POST /api/approve, read as change_request reads its body: a JSON object with a
-    string "version"."""
-    document = _json_body(content_type, body)
-    if not (isinstance(document, dict) and isinstance(document.get("version"), str)):
-        raise BadRequest('the body is not {"version": string}')
-    return document["version"]
-
-
-def reveal_request(content_type: str | None, body: bytes) -> None:
-    """Check the body of POST /api/reveal, read as change_request reads its body: a JSON object (the page sends
-    {}). A page of another port of 127.0.0.1 is same-site for the cookie; the no-cors POST it can send has no JSON
-    Content-Type, so it is refused here."""
-    if not isinstance(_json_body(content_type, body), dict):
-        raise BadRequest("the body is not a JSON object")
 
 
 def _english(error: BaseException) -> str:
@@ -356,7 +279,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif path in MEDIA_ROUTES:
             self._file(MEDIA_ROUTES[path](p), "video/mp4", ranges=True)
         elif path == "/api/data":
-            self._json(200, {**page_data(p), "state": review.state()["state"]})
+            self._json(200, {**page_data(p), **review.state()})
         elif path == "/api/state":
             self._json(200, review.status())
         else:
@@ -529,7 +452,8 @@ class ReviewServer:
         self._httpd = _HTTPServer(self)
         self.port = self._httpd.server_address[1]
         self.url = f"http://{HOST}:{self.port}/?key={quote(self.key, safe='')}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, name="review-server", daemon=True)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, args=(SERVE_POLL_S,), name="review-server",
+                                        daemon=True)
         self._thread.start()
         return self.url
 

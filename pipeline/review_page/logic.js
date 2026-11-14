@@ -1,11 +1,17 @@
 // The pure functions of the review page: times on the source and on the cut reel, the caption on screen, what
-// plays where, whether a polled version is a change of Claude's, where a popover goes, and what a caption being
-// edited marks, shows and saves. No DOM; review.js imports them, and tests/js/logic.test.mjs tests them.
+// plays where, whether a polled version is a change of Claude's, the fields of the page that hold the state of the
+// server (pageState), where a popover goes, what a caption being edited marks, shows and saves, and what the caption
+// editor does with its field: what a reload leaves in it (fieldAfterReload), whether it holds text that closing it
+// would lose (hasUnsavedCaption), and whether it stays when an editor is asked for (keepsOpenEditor). No DOM and no
+// import; review.js and editor.js import them, and tests/js/logic.test.mjs tests them.
 //
 // A segment is [start, end] in source seconds (GET /api/data's "segments": what stays in the reel, in order); a
 // source time is a time of the review video and the transcript, a reel time one of the cut reel. clock and
-// reelTime are the twins of storyboard.clock and edit.map_time: the same operations in the same order, so the page
-// shows the times the storyboard shows.
+// reelTime are the twins of storyboard.clock and edit.map_time: the same operations in the same order. The page
+// formats only the running clock of its player with clock (playerClock): a time the storyboard prints too (a length,
+// the time of a sentence, a candidate or a listen item) is a string the server made from the unrounded time
+// (review_data), which the page cannot get back from the seconds it is sent, rounded to the millisecond; so the
+// running clock at the end of the reel is the server's length string.
 
 // Segment times are on the 30 fps grid rounded to the millisecond, so a start may be up to half a millisecond
 // before the frame it stands for (frame 145 is at 4.8333 s, its start says 4.833), and a seek to it would show the
@@ -43,6 +49,18 @@ export function sourceTime(r, segments) {
     offset += length;
   }
   return segments.length ? segments[segments.length - 1][1] : 0;
+}
+
+// The running clock of the player at source time `t`, for a reel of `durationS` seconds that the server writes as
+// `durationClock` (made from the length before it was rounded to the millisecond, as clock of the rounded
+// `durationS` could round to another tenth: 12.3496 s is 0:12.3, but its rounded 12.35 is 0:12.4). At the end of the
+// reel, that is, at or past the end of the last segment (SEAM_S, as a seek to it lands), or at or past `durationS`
+// on the reel (the segments, rounded too, can add up to a millisecond or two more or less than it), it is that
+// string, so that the clock never reads past the length it is shown with; elsewhere clock of the reel time.
+export function playerClock(t, segments, durationS, durationClock) {
+  const r = reelTime(t, segments);
+  const end = segments.length ? segments[segments.length - 1][1] : 0;
+  return t >= end - SEAM_S || r >= durationS ? durationClock : clock(r);
 }
 
 // Where the video has to go from source time `t` while it plays: SEAM_S past the start of the next segment when `t`
@@ -116,6 +134,17 @@ export function pollVersion({ shown, failed, polled, own, outdated }) {
   if (shown === null) return { load: true, notice: false, own: null };
   if (polled === shown) return { load: failed, notice: false, own: null };
   return { load: true, notice: polled !== own, own: null };
+}
+
+// The fields of the page that hold the state of the server, from `status`: an answer of GET /api/state, or GET
+// /api/data, which carries the same four keys so that the first view needs no poll. A key the answer lacks is null.
+export function pageState(status) {
+  return {
+    state: status.state,
+    step: status.step ?? null,
+    outputs: status.outputs ?? null,
+    failedText: status.error ?? null,
+  };
 }
 
 // The space between a popover and its mark, and between a popover and the sides of the panel, in pixels.
@@ -220,4 +249,28 @@ export function previewLine(r, start, end, lines) {
 export function captionToSave(text, saved, original) {
   if (text === saved) return undefined;
   return text === original ? null : text;
+}
+
+// Whether the caption editor's field `text` holds something that saving would send (captionToSave), so closing the
+// editor without saving would lose it: what 同意 waits for, and what the page says it dropped when it closes the
+// editor itself.
+export function hasUnsavedCaption(text, saved, original) {
+  return captionToSave(text, saved, original) !== undefined;
+}
+
+// The text the caption editor's field shows once the data has loaded again, for a field that holds `field` and a
+// sentence whose saved caption was `previous` before the load and is `now` after it (Claude changed it): the new
+// caption when nothing was typed (the field still holds `previous`), so that saving does not write the old text back
+// over Claude's change and the field is not text to lose; what the user typed otherwise.
+export function fieldAfterReload(field, previous, now) {
+  return field === previous ? now : field;
+}
+
+// Whether the open caption editor stays when the editor of sentence `id` is asked for: `open` is { id, text, saved,
+// original } of the open editor (its sentence, field text, saved caption and the sentence's own text), or null. It
+// stays when it is of the same sentence, whatever its field holds (asking for it again changes nothing, and opening a
+// fresh one would drop what was typed), and when it is of another sentence and holds text that is not saved (opening
+// would drop that text). With nothing open, or another sentence's editor with nothing to save, the editor opens.
+export function keepsOpenEditor(open, id) {
+  return open !== null && (open.id === id || hasUnsavedCaption(open.text, open.saved, open.original));
 }

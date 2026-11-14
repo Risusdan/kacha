@@ -4,8 +4,10 @@ Every test that talks to a server gets one from the `served` fixture: a project 
 helpers.edited_project_from_script (the sentences are made up) whose edit.json passed validate and whose review video
 was made with real ffmpeg, and a ReviewServer on it with the key KEY. The speaker said extra words before sentence 2
 (t01, rejected by default) and before sentence 3 (t03), and a filler inside sentence 2 (t02, accepted by default).
-Requests go through http.client, so that a test can send any Host header and any Content-Type. Every server is stopped
-in a fixture finaliser, whatever the test did.
+The cases of a parametrisation that change nothing in the project but the log of the requests share one such project,
+made once for the module, each with a server of its own (`served_read_only`). Requests go through http.client, so
+that a test can send any Host header and any Content-Type. Every server is stopped in a fixture finaliser, whatever
+the test did.
 
 The approval tests give the server FakeSteps (storyboard, approve and render that record their calls, and can wait or
 raise) and fake shutil.disk_usage (the `disk` fixture), so that they run nothing real and do not depend on the free
@@ -14,6 +16,7 @@ subprocess.run replaced.
 """
 
 import http.client
+import inspect
 import json
 import socket
 import sys
@@ -30,6 +33,7 @@ from pipeline import review_server
 from pipeline.assets import MIN_FREE_GB
 from pipeline.edit import load_edit, validate_project
 from pipeline.errors import EditInvalid, PipelineError
+from pipeline.paths import studio_root
 from pipeline.project import Project, ProjectBusy, ProjectLock, approve_gate, gate_ok, run_step, step_done
 from pipeline.render import render
 from pipeline.captions import break_lines, remap_units
@@ -47,15 +51,13 @@ from pipeline.review_server import (
     REQUEST_TIMEOUT_S,
     REVIEW_IDLE_S,
     SERVER_ERROR_TEXT,
-    RangeNotSatisfiable,
     ReviewServer,
     Steps,
-    byte_range,
-    cookie_values,
     reveal_command,
     reveal_in_folder,
     serve_review,
 )
+from pipeline.review_requests import RangeNotSatisfiable, byte_range, cookie_values
 from pipeline.review_video import make_review_video, review_video_path
 from pipeline.storyboard import NOT_VALIDATED_REFUSAL, OLDER_FILES_REFUSAL, build_storyboard
 from pipeline.style import font_path, load_style, styles_root
@@ -132,6 +134,24 @@ def served(validated, serve):
     return Served(validated, serve(validated, key=KEY))
 
 
+@pytest.fixture(scope="module")
+def read_only_project(module_env) -> Project:
+    """A project as `validated` makes it, with its review video, made once in the module's own studio for the cases
+    that change nothing in it (served_read_only)."""
+    assert studio_root().is_relative_to(module_env)  # checked before anything is written
+    p = edited_project_from_script(module_env, SCRIPT, ASR)
+    validate_project(p)
+    make_review_video(p)
+    return p
+
+
+@pytest.fixture
+def served_read_only(read_only_project, serve):
+    """`served` on the module's shared project, with a server of the test's own: for a case that changes nothing in
+    the project but the log of the requests."""
+    return Served(read_only_project, serve(read_only_project, key=KEY))
+
+
 def ask(server: ReviewServer, method: str, path: str, *, cookie: str | None = KEY, host: str | None = None,
         headers: tuple[tuple[str, str], ...] = (), body: bytes | None = None, length: str | None = "auto",
         timeout: float = 30) -> Answer:
@@ -190,6 +210,19 @@ def log_text(p: Project) -> str:
 def editing(version: str) -> dict:
     """GET /api/state of a page that may change the edit."""
     return {"version": version, "state": "editing", "step": None, "error": None, "outputs": None}
+
+
+STATE_KEYS = ("state", "step", "error", "outputs")  # the keys of GET /api/state after the version
+
+
+def data_state(server: ReviewServer, timeout: float = 30) -> dict:
+    """The keys of GET /api/data that hold the state of the page (the ones GET /api/state has after its version):
+    what the first view of the page shows before its first poll."""
+    answer = ask(server, "GET", "/api/data", timeout=timeout)
+    assert answer.status == 200
+    document = answer.json()
+    assert all(key in document for key in STATE_KEYS), sorted(document)
+    return {key: document[key] for key in STATE_KEYS}
 
 
 def assert_json(answer: Answer, status: int, document: dict, case: str = "") -> None:
@@ -335,6 +368,25 @@ def test_the_page_files_are_served_by_their_fixed_names(served, tmp_path, monkey
     assert_json(ask(served.server, "GET", "/review.css"), 404, {"error": SERVER_ERROR_TEXT})
 
 
+PAGE_MODULES = ("review.js", "logic.js", "shared.js", "editor.js")  # the page's script: review.js, what it imports
+
+
+def test_every_module_of_the_page_is_served_with_the_key_and_refused_without_it(served):
+    # index.html loads review.js, which imports the others by relative URL: a browser asks for each of them by the
+    # route of its own name. The routes are exactly the page's files (nothing else reaches PAGE_DIR).
+    server = served.server
+    assert set(review_server.PAGE_FILES) == {"/", "/review.css", *(f"/{name}" for name in PAGE_MODULES)}
+    for name in PAGE_MODULES:
+        route = f"/{name}"
+        answer = ask(server, "GET", route)
+        assert (answer.status, answer.headers["Content-Type"]) == (200, "text/javascript; charset=utf-8"), route
+        assert answer.headers["Cache-Control"] == "no-store", route
+        assert answer.body == (PAGE_DIR / name).read_bytes(), route
+        for refused in (ask(server, "GET", route, cookie=None), ask(server, "GET", route, cookie="wrong")):
+            assert_json(refused, 403, {"error": DENIED_TEXT}, route)
+            assert "Set-Cookie" not in refused.headers, route
+
+
 def test_the_caption_font_is_the_one_the_style_names(served):
     style = load_style(load_edit(served.p.edit_path)["style"])
     assert style["captions"]["bold"] is True
@@ -364,11 +416,11 @@ def test_a_style_without_bold_captions_gives_the_regular_font(served, tmp_path, 
 
 @pytest.mark.parametrize("header, status, first, last", [
     ("bytes=0-1", 206, 0, 1), ("bytes=1000-", 206, 1000, SIZE - 1), ("bytes=-500", 206, SIZE - 500, SIZE - 1)])
-def test_ranges_of_the_review_video(served, header, status, first, last):
-    data = review_video_path(served.p).read_bytes()
+def test_ranges_of_the_review_video(served_read_only, header, status, first, last):
+    data = review_video_path(served_read_only.p).read_bytes()
     size = len(data)
     first, last = offset(first, size), offset(last, size)
-    answer = ask(served.server, "GET", "/media/review.mp4", headers=(("Range", header),))
+    answer = ask(served_read_only.server, "GET", "/media/review.mp4", headers=(("Range", header),))
     assert answer.status == status
     assert answer.headers["Content-Type"] == "video/mp4"
     assert answer.headers["Accept-Ranges"] == "bytes"
@@ -440,8 +492,29 @@ def test_byte_range_at_or_past_the_end_is_not_satisfiable(header, size):
 
 
 def test_data_is_page_data_with_the_state(served):
-    assert_json(ask(served.server, "GET", "/api/data"), 200, {**page_data(served.p), "state": "editing"})
+    assert_json(ask(served.server, "GET", "/api/data"), 200,
+                {**page_data(served.p), "state": "editing", "step": None, "error": None, "outputs": None})
     assert_json(ask(served.server, "GET", "/api/state"), 200, editing(edit_version(served.p)))
+
+
+def test_no_key_of_the_state_is_a_key_of_the_page_data(served):
+    assert not set(page_data(served.p)) & set(STATE_KEYS)
+
+
+def test_data_takes_the_state_from_one_snapshot(served, monkeypatch):
+    """state, step, error and outputs of the data come from one call of ReviewServer.state, so a job that ends
+    between two reads cannot give a page "working" with the error of the job's end."""
+    calls: list[int] = []
+
+    def state(self) -> dict:
+        calls.append(len(calls))
+        name = f"call {len(calls)}"
+        return {"state": name, "step": name, "error": name, "outputs": None}
+
+    monkeypatch.setattr(ReviewServer, "state", state)
+    document = ask(served.server, "GET", "/api/data").json()
+    assert len(calls) == 1
+    assert [document[key] for key in ("state", "step", "error")] == ["call 1"] * 3
 
 
 def test_data_while_edit_json_is_not_validated_is_409_in_chinese(served):
@@ -646,11 +719,13 @@ def test_caption_lines_preview_writes_nothing(served):
     ({"sentence": "s02", "text": "今天\u2028我們"}, REFUSED_TEXT),
     ({"sentence": "s99", "text": "好"}, REFUSED_TEXT),
 ])
-def test_a_caption_text_that_would_be_refused_is_422_in_chinese(served, document, text):
-    before = project_tree(served.p)
-    assert_json(post_lines(served.server, document), 422, {"error": text})
-    assert project_tree(served.p) == before
-    assert "refused" not in log_text(served.p)  # only a change is logged: a preview goes with every keystroke
+def test_a_caption_text_that_would_be_refused_is_422_in_chinese(served_read_only, document, text):
+    p, server = served_read_only.p, served_read_only.server
+    before = project_tree(p)
+    logged = len(log_text(p))  # the log is shared by the cases of this module: read only what this request adds
+    assert_json(post_lines(server, document), 422, {"error": text})
+    assert project_tree(p) == before
+    assert "refused" not in log_text(p)[logged:]  # only a change is logged: a preview goes with every keystroke
 
 
 def test_caption_lines_take_no_lock(served):
@@ -763,6 +838,28 @@ def test_stop_closes_the_port_and_wait_returns_stopped(served, serve):
     with pytest.raises(ConnectionRefusedError):
         ask(server, "GET", "/api/state")
     server.stop()  # a second stop does nothing
+
+
+def test_the_server_polls_often_so_that_stop_does_not_wait_half_a_second(read_only_project, serve, monkeypatch):
+    """stop() calls shutdown(), which waits until serve_forever next looks at its flag: it looks every poll_interval
+    seconds. The server passes SERVE_POLL_S, a twentieth of a second at most, not the standard library's default of
+    half a second. A spy on serve_forever reads the interval it got, as a clock could not: the wait is anywhere
+    from none to a whole interval."""
+    original = review_server._HTTPServer.serve_forever
+    polls = []
+
+    def spy(self, *args, **kwargs):
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        polls.append(bound.arguments["poll_interval"])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(review_server._HTTPServer, "serve_forever", spy)
+    server = serve(read_only_project, key=KEY)
+    assert ask(server, "GET", "/api/state").status == 200
+    server.stop()
+    assert len(polls) == 1 and polls[0] <= 0.05
+    assert polls == [review_server.SERVE_POLL_S]
 
 
 def test_stop_waits_for_a_change_being_applied(served, monkeypatch):
@@ -1004,8 +1101,7 @@ def test_changes_wait_for_the_job_and_are_refused_while_it_runs(validated, serve
     # the polls never wait for the change lock, which the job holds
     assert state_of(server, timeout=5) == {"version": version, "state": "working", "step": "render", "error": None,
                                            "outputs": None}
-    data = ask(server, "GET", "/api/data", timeout=5)
-    assert data.status == 200 and data.json()["state"] == "working"
+    assert data_state(server, timeout=5) == {"state": "working", "step": "render", "error": None, "outputs": None}
     assert_json(post_change(server, version, cut("t01")), 423, {"error": BUSY_TEXT})
     assert_json(post_approve(server, version, timeout=5), 423, {"error": BUSY_TEXT})
     assert p.edit_path.read_bytes() == before
@@ -1062,7 +1158,7 @@ def test_a_failed_render_is_failed_in_chinese_and_logged(validated, serve_job, s
     assert settled(server) == failed
     order = ["storyboard", "approve", "render"]
     assert [call[0] for call in fake.calls] == order[:order.index(step) + 1]
-    assert ask(server, "GET", "/api/data").json()["state"] == "failed"
+    assert data_state(server) == {"state": "failed", "step": None, "error": FAILED_TEXT, "outputs": None}
     log = log_text(p)
     assert all(text in log for text in logged), log
     assert f"failed in {step}" in log
@@ -1158,7 +1254,7 @@ def test_an_approval_in_the_chat_shows_as_approved(meijia, serve, disk):
     before = p.edit_path.read_bytes()
     assert state_of(server) == {"version": version, "state": "approved", "step": None, "error": None,
                                 "outputs": None}
-    assert ask(server, "GET", "/api/data").json()["state"] == "approved"
+    assert data_state(server) == {"state": "approved", "step": None, "error": None, "outputs": None}
     assert_json(post_change(server, version, cut("t01")), 423, {"error": APPROVED_TEXT})
     assert_json(post_approve(server, version), 423, {"error": APPROVED_TEXT})
     assert p.edit_path.read_bytes() == before
@@ -1191,10 +1287,11 @@ def test_done_lists_the_outputs_and_reveal_calls_the_injected_function(meijia, s
     done = {"version": version, "state": "done", "step": None, "error": None,
             "outputs": {"final": str(final), "preview": None, "folder": str(p.out)}}
     assert state_of(server) == done
+    assert data_state(server) == {key: done[key] for key in STATE_KEYS}
     (p.out / "preview.mp4").write_bytes(b"a stand-in for the preview")
     done["outputs"]["preview"] = str(p.out / "preview.mp4")
     assert state_of(server) == done
-    assert ask(server, "GET", "/api/data").json()["state"] == "done"
+    assert data_state(server) == {key: done[key] for key in STATE_KEYS}
     assert_json(post_change(server, version, cut("t01")), 423, {"error": APPROVED_TEXT})
     assert_json(post_approve(server, version), 423, {"error": APPROVED_TEXT})
 

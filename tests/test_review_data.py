@@ -7,6 +7,7 @@ cut point needs listening), written into a project by helpers.edited_project_fro
 import hashlib
 import json
 import re
+from pathlib import Path
 
 import pytest
 from helpers import (
@@ -17,12 +18,22 @@ from helpers import (
     validated_storyboard,
 )
 
+from pipeline import project as project_module
 from pipeline.captions import build_events, caption_top_px
-from pipeline.edit import NOTE_PREFIX, NOTE_REASON, build_segments, require_valid, total_duration, validate_project
+from pipeline.edit import (
+    NOTE_PREFIX,
+    NOTE_REASON,
+    build_segments,
+    map_time,
+    require_valid,
+    total_duration,
+    validate_project,
+)
 from pipeline.errors import EditInvalid, PipelineError
 from pipeline.project import file_sha256
 from pipeline.review_data import NOT_READY_TEXT, NotReady, edit_version, page_data, sentence_tokens
 from pipeline.review_text import ASR_NOTE, LISTEN_NOTE, LOW_MATCH_NOTE, REMOVED_REASON, trim_label
+from pipeline.storyboard import clock
 from pipeline.style import font_path, load_style
 from pipeline.trim import pause_reason
 
@@ -133,6 +144,23 @@ def test_the_version_of_a_project_without_edit_json(tmp_path):
                                          file_sha256(p.work / "trim.json"))
 
 
+def test_the_version_when_edit_json_goes_away_while_it_is_hashed(tmp_path, monkeypatch):
+    """edit.json is deleted after its stat and before it is read: the version is that of a project without it, not
+    an error (the page would get a 500)."""
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。", "今天我們來聊剪輯")
+    p = project_for(tmp_path, transcript, trims)
+    real = project_module.file_sha256
+
+    def hash_after_the_delete(path):
+        if Path(path) == p.edit_path:
+            p.edit_path.unlink()
+        return real(path)
+
+    monkeypatch.setattr(project_module, "file_sha256", hash_after_the_delete)
+    assert edit_version(p) == version_of(None, file_sha256(p.work / "transcript.json"),
+                                         file_sha256(p.work / "trim.json"))
+
+
 def test_segments_and_duration_are_build_segments(tmp_path):
     transcript, trims = transcript_and_trims("今天我們來聊剪輯。第二句話。", "今天我們嗯來聊剪輯第二句話")
     p = project_for(tmp_path, transcript, trims)
@@ -145,6 +173,67 @@ def test_segments_and_duration_are_build_segments(tmp_path):
     assert data["source_s"] == json.loads((p.work / "probe.json").read_text(encoding="utf-8"))["duration_s"]
     assert data["project"] == p.name and data["mode"] == "line"
     assert json.loads(json.dumps(data)) == data  # nothing but JSON values
+
+
+def test_the_lengths_are_the_clock_of_the_unrounded_lengths(tmp_path):
+    """The page shows the lengths as it is sent them: a length at a tenth's edge (12.3496 s, which the storyboard
+    shows as 0:12.3) is not rounded to 12.35 first and then to 0:12.4."""
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。第二句話。", "今天我們嗯來聊剪輯第二句話")
+    p = project_for(tmp_path, transcript, trims)
+    probe = json.loads((p.work / "probe.json").read_text(encoding="utf-8"))
+    probe["duration_s"] = 12.3496
+    (p.work / "probe.json").write_text(json.dumps(probe), encoding="utf-8")
+    edit, _, _ = require_valid(p)
+    data = page_data(p)
+    assert data["source_s"] == 12.35 and clock(data["source_s"]) == "0:12.4"  # what rounding twice would show
+    assert data["source_clock"] == clock(12.3496) == "0:12.3"
+    assert data["duration_clock"] == clock(total_duration(build_segments(edit, transcript, trims)))
+    md = Path(validated_storyboard(p)["md"]).read_text(encoding="utf-8")
+    assert f"- 原長：{data['source_clock']}\n- 新長：{data['duration_clock']}\n" in md
+
+
+def md_listen_times(md: str) -> list[str]:
+    """The reel time storyboard.md prints for each item of the list 其他要聽的地方, in order."""
+    section = md.split("## 其他要聽的地方")[1].split("\n## ")[0]
+    return re.findall(r"(?m)^\d+\. (\d+:\d\d\.\d) ", section)
+
+
+def listen_times(data: dict) -> list[str]:
+    """The reel time the page data holds for each item of nav.listen: its own for an item about a sentence, its
+    row's for an item about a candidate."""
+    rows = {row["id"]: row for row in data["trims"]}
+    return [item["time"] if "sentence" in item else rows[item["trim"]]["time"] for item in data["nav"]["listen"]]
+
+
+def test_a_listen_item_has_its_reel_time_as_the_storyboard_prints_it(tmp_path):
+    """A sentence that starts at 0.8496 s, 0:00.8 on the reel: the page data holds that string, not the 0.8496 s
+    rounded to 0.85 s, which the page would round again to 0:00.9."""
+    script = "第一句話。一二三四五六七八九十。第三句話。"
+    transcript, trims = transcript_and_trims(
+        script, [("第一句話", 0.0, 0.8), ("一二三四五六七八天地", 0.8, 2.8), ("第三句話", 3.0, 3.8)])
+    low = transcript["sentences"][1]
+    assert "low_match" in low["reasons"]
+    low["start"] = 0.8496
+    p = project_for(tmp_path, transcript, trims)
+    edit, _, _ = require_valid(p)
+    segments = build_segments(edit, transcript, trims)
+    data = page_data(p)
+    [entry] = [item for item in data["nav"]["listen"] if item["kind"] == "low_match"]
+    assert entry["start"] == 0.85
+    assert clock(map_time(entry["start"], segments)) == "0:00.9"  # twice rounded, off by a tenth
+    assert entry["time"] == clock(map_time(0.8496, segments)) == "0:00.8"
+    md = Path(validated_storyboard(p)["md"]).read_text(encoding="utf-8")
+    assert md_listen_times(md) == listen_times(data) == ["0:00.8"]
+
+
+def test_every_listen_item_of_a_loud_project_has_the_time_of_the_storyboard(tmp_path):
+    transcript, trims = transcript_and_trims("這個方法可以省下時間。第二句話。", "这招能帮你省很多事第二句話",
+                                             loud=[(0.0, 4.0)])
+    p = project_for(tmp_path, transcript, trims)
+    data = page_data(p)
+    assert len(data["nav"]["listen"]) >= 2
+    md = Path(validated_storyboard(p)["md"]).read_text(encoding="utf-8")
+    assert md_listen_times(md) == listen_times(data)
 
 
 def test_the_mode_is_the_caption_mode_of_the_edit(tmp_path):
@@ -438,10 +527,10 @@ def test_the_cut_of_a_candidate_listens_when_its_cut_point_is_in_speech(tmp_path
     assert (row["cut"], row["in_reel"], row["listen"], row["listen_note"]) == (True, True, True, LISTEN_NOTE)
     assert row["time"] == "0:01.2"
     assert {"trim": filler["id"], "start": filler["start"]} in data["nav"]["listen"]
-    head = {"sentence": "s01", "kind": "cut_point", "start": 0.0, "end": 0.0, "note": LISTEN_NOTE}
+    head = {"sentence": "s01", "kind": "cut_point", "time": "0:00.0", "start": 0.0, "end": 0.0, "note": LISTEN_NOTE}
     assert head in data["nav"]["listen"]  # the head of the reel
     for entry in data["nav"]["listen"]:
-        assert set(entry) in ({"trim", "start"}, {"sentence", "kind", "start", "end", "note"})
+        assert set(entry) in ({"trim", "start"}, {"sentence", "kind", "time", "start", "end", "note"})
     edit = default_edit(transcript, trims)
     edit["cuts"]["accept"].remove(filler["id"])
     edit["cuts"]["reject"].append(filler["id"])
@@ -461,10 +550,11 @@ def test_a_cut_point_of_a_sentence_says_to_listen_around_it_and_never_shows_the_
     assert [entry["sentence"] for entry in edges] == ["s01", "s02"]  # the head and the tail of the reel
     tail_end = data["sentences"][1]["end"]
     assert edges == [
-        {"sentence": "s01", "kind": "cut_point", "start": 0.0, "end": 0.0, "note": LISTEN_NOTE},
-        {"sentence": "s02", "kind": "cut_point", "start": edges[1]["start"], "end": edges[1]["start"],
-         "note": LISTEN_NOTE},
+        {"sentence": "s01", "kind": "cut_point", "time": "0:00.0", "start": 0.0, "end": 0.0, "note": LISTEN_NOTE},
+        {"sentence": "s02", "kind": "cut_point", "time": edges[1]["time"], "start": edges[1]["start"],
+         "end": edges[1]["start"], "note": LISTEN_NOTE},
     ]
+    assert re.fullmatch(r"0:0\d\.\d", edges[1]["time"])
     assert abs(edges[1]["start"] - tail_end) < 0.5  # the tail is at the end of the last sentence
     edit = default_edit(transcript, trims)
     claude_note = f"{NOTE_PREFIX}聽一下開頭{NOTE_REASON}第一個字講得很輕。"
@@ -481,7 +571,8 @@ def test_a_low_match_sentence_says_to_listen_to_the_whole_sentence(tmp_path):
     data = page_data(project_for(tmp_path, transcript, trims))
     assert data["sentences"][0]["note"] is None
     assert data["nav"]["listen"] == [
-        {"sentence": "s01", "kind": "low_match", "start": first["start"], "end": first["end"], "note": LOW_MATCH_NOTE},
+        {"sentence": "s01", "kind": "low_match", "time": "0:00.0", "start": first["start"], "end": first["end"],
+         "note": LOW_MATCH_NOTE},
     ]
     edit = default_edit(transcript, trims)
     claude_note = f"{NOTE_PREFIX}聽一下這一句{NOTE_REASON}講得比腳本快。"

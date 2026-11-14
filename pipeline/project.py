@@ -7,8 +7,16 @@ skips it when its inputs have not changed and its outputs are still there. An in
 unchanged when its size and modification time are the recorded ones (its recorded hash is then
 used without reading the file), or else when its hash is the recorded one. Project.dir is always
 a resolved path, because safe_rmtree refuses targets reached through a symbolic link.
+
+The review page's server and a command from the chat are other processes that may write state.json at the
+same moment. Every change of it after create_project (run_step, record_edit_checked, approve_gate) goes
+through update_state, which loads the file again, changes it and saves it under an exclusive lock of
+work/STATE_LOCK_FILE, so the later save never drops the other's change. A state loaded before, outside the
+lock, is only read: the checks and the hashing of big files happen there, before the lock is taken. A plain
+read (load_state) takes no lock, as save_state replaces the file in one step.
 """
 
+import copy
 import datetime
 import fcntl
 import hashlib
@@ -16,8 +24,8 @@ import json
 import os
 import re
 import secrets
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
@@ -27,14 +35,17 @@ from pipeline.paths import projects_root
 from pipeline.safe_delete import safe_rmtree
 
 STATE_VERSION = 1
-# The format version of the file each of these steps writes (transcript.json, trim.json). run_step records it,
-# and a record of another version (or of none, as phase 1 wrote them) is out of date: the step runs again.
-FORMAT_VERSIONS: dict[str, int] = {"transcribe": 2, "trim": 2}
+# The version of what each of these steps makes: for transcribe and trim the format of the file it writes
+# (transcript.json, trim.json), for render what it does to the sound (2: the voice treatment of pipeline.voice).
+# run_step records it, and a record of another version (or of none, as earlier versions wrote them) is out of date:
+# the step runs again.
+FORMAT_VERSIONS: dict[str, int] = {"transcribe": 2, "trim": 2, "render": 2}
 GATES = ("gate1",)
 EARLY_STEPS = ("prep", "transcribe", "trim")  # in the order of the flow; the storyboard is built on their results
 _STATE_KEYS = ("source", "steps", "gates")
 _EDIT_FILES = ("edit", "transcript", "trim")  # the files edit_checked in state.json holds a sha256 of
 LOCK_FILE = "output.lock"  # in work/: the file ProjectLock locks
+STATE_LOCK_FILE = "state.lock"  # in work/: the file update_state locks around each change of state.json
 _TEMP_TRIES = 100  # write_text_atomically gives up after this many temp names that are taken
 PROJECT_BUSY_ERROR = "another storyboard, approve or render is running for this project: wait until it ends"
 
@@ -202,7 +213,8 @@ def load_project(name: str) -> Project:
 def load_state(p: Project) -> dict:
     """state.json of `p`. A file that is not JSON, not an object, lacks source, steps or gates, or holds
     something other than an object for steps, gates, a step record or a gate is reported as unreadable
-    (a PipelineError), never as a raw JSON, key or type error."""
+    (a PipelineError), never as a raw JSON, key or type error. Takes no lock: a change of the state goes
+    through update_state, which loads the file again under the state lock."""
 
     def unreadable(reason: str) -> PipelineError:
         return PipelineError(f"state.json of project {p.name!r} is unreadable: {reason}")
@@ -260,6 +272,40 @@ def save_state(p: Project, state: dict) -> None:
     """Write state.json through a temp file of its own in the same folder, then replace it in one step
     (write_text_atomically)."""
     write_text_atomically(p.state_path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+
+@contextmanager
+def _state_lock(p: Project) -> Iterator[None]:
+    """Hold the state lock of `p`: an exclusive flock on work/STATE_LOCK_FILE, waiting until whoever holds it lets
+    it go. The file is opened anew each time (made when missing, never deleted), so two holders in one process
+    exclude each other too, as two ProjectLocks do; closing it lets the lock go, also when the body raises."""
+    path = p.work / STATE_LOCK_FILE
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+    except OSError as error:
+        raise PipelineError(f"cannot open the lock file {path}: {error.strerror or error}") from error
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def update_state[T](p: Project, change: Callable[[dict], T]) -> T:
+    """Change state.json of `p` without losing a change another writer makes at the same moment: under the state
+    lock (_state_lock), load the file again, call change(state), which changes the state in place, and save it when
+    it changed. Returns what `change` returns. When `change` raises, nothing is saved and the lock is let go.
+
+    The lock is a leaf: it is held only for this load, change and save of a small file. `change` must be quick (no
+    step, no hashing of big files), must take no other lock and must not call update_state, which would wait for
+    itself. ProjectLock may be held around it, never the other way round."""
+    with _state_lock(p):
+        state = load_state(p)
+        loaded = copy.deepcopy(state)
+        result = change(state)
+        if state != loaded:
+            save_state(p, state)
+    return result
 
 
 class ProjectBusy(PipelineError):
@@ -332,7 +378,8 @@ HashCache = dict[str, str]
 
 def _input_entry(path: Path | str, recorded: dict | None, cache: HashCache) -> dict | None:
     """What a step input record holds for the file at `path` now: path, sha256, size and mtime_ns. None
-    when it is not a file.
+    when it is not a file, also when it is deleted between its stat and its hashing (the FileNotFoundError of
+    that is not raised; any other error while hashing is).
 
     When `recorded` (an earlier record of the same path) has the same size and mtime_ns, its sha256 is
     taken as it is and the file is not read. Otherwise the file is hashed, once per call through `cache`.
@@ -350,7 +397,10 @@ def _input_entry(path: Path | str, recorded: dict | None, cache: HashCache) -> d
             sha256 = recorded.get("sha256")
     if sha256 is None:
         if key not in cache:
-            cache[key] = file_sha256(Path(path))
+            try:
+                cache[key] = file_sha256(Path(path))
+            except FileNotFoundError:  # deleted after the stat: not a file any more, as when the stat fails
+                return None
         sha256 = cache[key]
     return {"path": key, "sha256": sha256, "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
@@ -361,21 +411,33 @@ def _current_sha256(path: Path | str, recorded: dict | None, cache: HashCache) -
     return None if entry is None else entry["sha256"]
 
 
-def _refresh_recorded_stat(p: Project, state: dict, step: str, current: dict[str, dict]) -> None:
-    """Write the size and mtime_ns of each input as they are now into the record of `step`, where a record
-    lacks them (written before they were recorded) or holds others (the file was touched, its content is
-    the same). Nothing else in the record changes, and state.json is written only when something did."""
+def _refresh_stat(record: dict | None, current: dict[str, dict]) -> bool:
+    """Write the size and mtime_ns of each input of `current` into the step record `record`, where its input
+    record of the same name holds the same path and sha256 and lacks them (written before they were recorded) or
+    holds others (the file was touched, its content is the same). Nothing else changes. Returns whether
+    anything did; a record that is None has nothing to change."""
+    if record is None:
+        return False
+    inputs = record.get("inputs")
     changed = False
     for key, entry in current.items():
-        recorded = state["steps"][step]["inputs"][key]
-        if recorded.get("path") != entry["path"]:
+        recorded = inputs.get(key) if isinstance(inputs, dict) else None
+        if not isinstance(recorded, dict) or any(recorded.get(field) != entry[field] for field in ("path", "sha256")):
             continue
         for field in ("size", "mtime_ns"):
             if recorded.get(field) != entry[field]:
                 recorded[field] = entry[field]
                 changed = True
-    if changed:
-        save_state(p, state)
+    return changed
+
+
+def _refresh_recorded_stat(p: Project, state: dict, step: str, current: dict[str, dict]) -> None:
+    """Write the size and mtime_ns of each input as they are now (`current`) into the record of `step` (see
+    _refresh_stat). `state` is the state run_step loaded before it hashed the inputs: when its record has nothing
+    to refresh, state.json is left alone. Otherwise the record is refreshed in state.json as it is now
+    (update_state), where it still holds the same files with the same content."""
+    if _refresh_stat(copy.deepcopy(state["steps"].get(step)), current):
+        update_state(p, lambda fresh: _refresh_stat(fresh["steps"].get(step), current))
 
 
 def _format_current(step: str, record: dict) -> bool:
@@ -409,7 +471,8 @@ def run_step(
     and a record of another version (or of none) is not skipped.
 
     The step record is dropped before `fn` runs and written again only when it returns, so a
-    step that failed half way is never reported as done."""
+    step that failed half way is never reported as done. Each of these writes goes through update_state; the
+    hashing of the inputs and `fn` itself run without the state lock."""
     state = load_state(p)
     record = state["steps"].get(step)
     recorded_inputs = {} if force or record is None else record.get("inputs", {})
@@ -434,18 +497,15 @@ def run_step(
         _refresh_recorded_stat(p, state, step, current)
         return {"skipped": True}
 
-    if record is not None:
-        del state["steps"][step]
-        save_state(p, state)
+    update_state(p, lambda fresh: fresh["steps"].pop(step, None))  # whoever wrote it, it goes before fn runs
     result = fn()
-    state = load_state(p)
-    state["steps"][step] = {
+    done = {
         "done_at": _now(),
         **({"version": FORMAT_VERSIONS[step]} if step in FORMAT_VERSIONS else {}),
         "inputs": current,
         "outputs": recorded_outputs,
     }
-    save_state(p, state)
+    update_state(p, lambda fresh: fresh["steps"].__setitem__(step, done))
     return {**result, "skipped": False}
 
 
@@ -522,13 +582,15 @@ def _edit_checked(state: dict) -> dict[str, str] | None:
 
 def record_edit_checked(p: Project, hashes: dict[str, str | None]) -> dict[str, str] | None:
     """Record in state.json that validate passed on the files with these hashes (edit_file_hashes, taken
-    before the files were read, so that a file that changed meanwhile fails the next comparison). Returns
-    the record it replaces, None when there was none or it was malformed."""
-    state = load_state(p)
-    previous = _edit_checked(state)
-    state["edit_checked"] = dict(hashes)
-    save_state(p, state)
-    return previous
+    before the files were read, so that a file that changed meanwhile fails the next comparison), through
+    update_state. Returns the record it replaces, None when there was none or it was malformed."""
+
+    def record(state: dict) -> dict[str, str] | None:
+        previous = _edit_checked(state)
+        state["edit_checked"] = dict(hashes)
+        return previous
+
+    return update_state(p, record)
 
 
 def _edit_stage(p: Project, state: dict, cache: HashCache) -> str | None:
@@ -572,7 +634,8 @@ def approve_gate(p: Project, gate: str) -> dict:
 
     The record holds the hash of every input of the storyboard step, edit.json among them
     (storyboard_inputs): the user approved the storyboard as it was shown, which also depends on
-    transcript.json, trim.json and the rest, not only on edit.json."""
+    transcript.json, trim.json and the rest, not only on edit.json. The checks run on state.json as loaded
+    first, without the state lock; only the record is written through update_state."""
     if gate not in GATES:
         raise PipelineError(f"unknown gate {gate!r}, expected one of {', '.join(GATES)}")
     state = load_state(p)
@@ -586,8 +649,7 @@ def approve_gate(p: Project, gate: str) -> dict:
         "approved_at": _now(),
         "storyboard_inputs": _storyboard_input_hashes(state),
     }
-    state["gates"][gate] = record
-    save_state(p, state)
+    update_state(p, lambda fresh: fresh["gates"].__setitem__(gate, record))
     return record
 
 

@@ -2,7 +2,8 @@
 
 render() refuses unless gate 1 was approved for the storyboard as it stands now (project.gate_ok). It then works in
 work/render/: captions.ass, the two static fonts in fonts/, cut.wav (the audio cut at the segments, with a
-short fade at every join), the filter script, render.log. ffmpeg runs in that folder, so the graph names
+short fade at every join), voice.wav (cut.wav through the voice treatment of pipeline.voice: cleaned up and brought
+to -14 LUFS; its log is voice.log), the filter script, render.log. ffmpeg runs in that folder, so the graph names
 only captions.ass and fonts (a studio path with a space or a quote cannot break it), and writes
 out/final.tmp.mp4; that file is renamed to out/final.mp4 only after check_output and check_fontselect found
 nothing wrong. ffmpeg gets two attempts. Each attempt overwrites render.log, so the file holds the log of the
@@ -17,7 +18,7 @@ The captions sit at the fixed top caption_top_px gives (the style's captions.bot
 the picture shows, so the render reads no faces.json.
 
 The video bitrate is 12 Mbps for a reel up to about 3 minutes and lower for a longer one, so that the file stays
-under 300 MB (see video_bitrate); the audio is AAC at 192 kbit/s.
+under 300 MB (see video_bitrate); the audio is voice.wav as AAC at 192 kbit/s.
 
 After the final, render makes out/preview.mp4 (540x960, under 30 MiB) from it as a step of its own (see make_preview):
 a copy small enough to send in a chat, to look at, not to publish. It does not stand in the way of the render: when it
@@ -40,6 +41,7 @@ from pipeline.errors import PipelineError
 from pipeline.media import FFPROBE_TIMEOUT_S, ffprobe_json, run_ffmpeg
 from pipeline.project import Project, first_stale_step, gate_ok, run_step
 from pipeline.style import font_path, load_style
+from pipeline.voice import treat_voice
 from pipeline.words import caption_inputs
 
 FADE_S = 0.01  # the fade at each end of a segment of the audio
@@ -162,11 +164,11 @@ def _ffmpeg_rate(bits_per_s: int) -> str:
 
 
 def build_ffmpeg_args(
-    video_src: Path, cut_wav: Path, segments: list[Segment], out: Path, filter_script: Path
+    video_src: Path, sound_wav: Path, segments: list[Segment], out: Path, filter_script: Path
 ) -> list[str]:
     """Write the filter graph to `filter_script` and return the ffmpeg arguments that render `out` from the
-    picture of `video_src` and the sound of `cut_wav`. The graph names captions.ass and fonts relative to
-    the folder ffmpeg runs in. A frame rate of 30 and one scale to cover 1080x1920 (every source is scaled
+    picture of `video_src` and the sound of `sound_wav` (already cut, and treated: voice.wav). The graph names
+    captions.ass and fonts relative to the folder ffmpeg runs in. A frame rate of 30 and one scale to cover 1080x1920 (every source is scaled
     once). The video bitrate is the one video_bitrate gives for the length the segments add up to; it is worked
     out first, so a reel too long for MIN_VIDEO_BITRATE raises before the script is written, as does a list of no
     segments."""
@@ -180,7 +182,7 @@ def build_ffmpeg_args(
     )
     Path(filter_script).write_text(graph, encoding="utf-8")
     return [
-        "-hide_banner", "-loglevel", "verbose", "-y", "-i", str(video_src), "-i", str(cut_wav),
+        "-hide_banner", "-loglevel", "verbose", "-y", "-i", str(video_src), "-i", str(sound_wav),
         "-/filter_complex", str(filter_script), "-map", "[v]", "-map", "1:a",
         "-c:v", VIDEO_ENCODER, "-b:v", _ffmpeg_rate(rate), "-profile:v", "high", "-r", str(FPS),
         "-fps_mode", "cfr", "-tag:v", "avc1",
@@ -434,9 +436,10 @@ def _make(p: Project, plan: _Plan, final: Path, runner: Callable) -> dict:
     write_ass(plan.events, plan.style, plan.top_px, plan.edit["captions"]["mode"], work / "captions.ass",
               font=plan.font)
     cut_audio(p.work / "audio48k.wav", plan.segments, work / "cut.wav")
+    treat_voice(work / "cut.wav", work / "voice.wav", work / "voice.log")
 
     temp, log = p.out / "final.tmp.mp4", work / "render.log"
-    args = build_ffmpeg_args(plan.video, work / "cut.wav", plan.segments, temp, work / "filter.txt")
+    args = build_ffmpeg_args(plan.video, work / "voice.wav", plan.segments, temp, work / "filter.txt")
     try:
         for attempts in range(1, ATTEMPTS + 1):
             temp.unlink(missing_ok=True)

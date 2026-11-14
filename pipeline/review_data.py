@@ -7,8 +7,12 @@ hash of edit.json, transcript.json and trim.json together; a change the page sen
 
 Every time is in seconds rounded to 3 places: segments and the start and end of a sentence, a candidate and an
 item of nav.listen are source time (what the review video and the transcript use), captions are time on the cut
-reel. A time the page shows to the user is a string of the cut reel (storyboard.clock). Nothing the page shows holds
-a sentence id, a candidate id or an English reason: ids are in the id, trim and sentence fields and in nav only.
+reel. A time the page shows to the user is a string (storyboard.clock), made here once from the time before it is
+rounded, as storyboard.md prints it: source_clock (the length of the source, 原長) and duration_clock (the length of
+the cut reel, 新長), and, on the cut reel, the time of a sentence and of a candidate, and the time of an item of
+nav.listen about a sentence. The page formats only the running clock of its player (at the end of the reel, that clock
+shows duration_clock). Nothing the page shows holds a sentence id, a candidate id or an English reason: ids are in the
+id, trim and sentence fields and in nav only.
 
 The page numbers the decisions it asks (a reworded take, extra speech: review_items' reworded and extra) from 1 in
 time order. A sentence whose captions show the recognised text is a decision of its own kind in review_items; the
@@ -24,9 +28,9 @@ own, whose captions show the recognised text, and nav.asr lists the same sentenc
 Claude's, else ASR_NOTE when asr is true.
 
 An item of nav.listen is about a candidate ({"trim", "start"}: its row has the note) or about a sentence
-({"sentence", "kind", "start", "end", "note"}): a cut point of the reel (kind cut_point, start and end both its
-time) or a sentence that matches the script poorly (low_match, from its start to its end). Its note is Claude's
-note for the sentence, else LISTEN_NOTE or LOW_MATCH_NOTE.
+({"sentence", "kind", "time", "start", "end", "note"}): a cut point of the reel (kind cut_point, start and end both
+its time) or a sentence that matches the script poorly (low_match, from its start to its end); "time" is where it is
+in the cut reel. Its note is Claude's note for the sentence, else LISTEN_NOTE or LOW_MATCH_NOTE.
 
 cuts is the number of cuts the storyboard counts: the accepted candidates in the reel and the cuts.extra ranges.
 """
@@ -36,6 +40,7 @@ import json
 
 from pipeline.captions import build_events, caption_source, caption_top_px
 from pipeline.edit import (
+    Segment,
     build_segments,
     caption_texts,
     kept_sentences,
@@ -233,7 +238,9 @@ def page_data(p: Project) -> dict:
         "version": version,
         "mode": edit["captions"]["mode"],
         "source_s": _seconds(float(probe["duration_s"])),
+        "source_clock": clock(float(probe["duration_s"])),
         "duration_s": _seconds(total_duration(segments)),
+        "duration_clock": clock(total_duration(segments)),
         "segments": [[_seconds(segment.start), _seconds(segment.end)] for segment in segments],
         "captions": [
             {"start": _seconds(event.start), "end": _seconds(event.end),
@@ -252,7 +259,7 @@ def page_data(p: Project) -> dict:
             "decisions": asked,
             "listen": [
                 {"trim": item.trim, "start": _seconds(item.time)} if item.trim is not None
-                else _sentence_listen(item, sentences_by_id[item.sentence], notes)
+                else _sentence_listen(item, sentences_by_id[item.sentence], notes, segments)
                 for item in listen
             ],
             "asr": recognised,
@@ -260,14 +267,16 @@ def page_data(p: Project) -> dict:
     }
 
 
-def _sentence_listen(item: Item, sentence: dict, notes: dict) -> dict:
+def _sentence_listen(item: Item, sentence: dict, notes: dict, segments: list[Segment]) -> dict:
     """The nav.listen entry of a listen item about a sentence: a cut point of the reel (cut_point) plays around
-    its time, a sentence that matches the script poorly (low_match) plays the whole sentence. The note is Claude's
-    note for the sentence, else the fixed one of the kind."""
+    its time, a sentence that matches the script poorly (low_match) plays the whole sentence. The time is the
+    item's place in the cut reel as the storyboard prints it, from the time before it is rounded. The note is
+    Claude's note for the sentence, else the fixed one of the kind."""
     low_match = item.kind == "low_match"
     return {
         "sentence": item.sentence,
         "kind": item.kind,
+        "time": clock(map_time(item.time, segments)),
         "start": _seconds(item.time),
         "end": _seconds(sentence["end"] if low_match else item.time),
         "note": notes.get(item.sentence) or (LOW_MATCH_NOTE if low_match else LISTEN_NOTE),

@@ -238,6 +238,15 @@ def test_a_caption_text_with_a_character_to_show_is_taken(T, TR):
         assert validate_edit(e, T, TR) == [], text
 
 
+def test_a_caption_text_that_replaces_a_quoted_word_is_taken():
+    """「好」。 becomes 棒: the place of 棒 falls on the 「, which holds no unit; 棒 takes the unit of 好."""
+    T2, TR2 = transcript_and_trims("「好」。第二句話。", asr="好第二句話")
+    assert [u["span"] for u in T2["sentences"][0]["units"]] == [[1, 2]]
+    e = default_edit(T2, TR2)
+    e["captions"]["text"] = {"s01": "棒"}
+    assert validate_edit(e, T2, TR2) == []
+
+
 def test_caption_texts_reads_what_is_there_and_ignores_what_is_malformed():
     assert caption_texts({"captions": {"mode": "line", "text": {"s01": "好", "s02": "對"}}}) == {"s01": "好", "s02": "對"}
     assert caption_texts({"captions": {"mode": "line"}}) == {}

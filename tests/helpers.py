@@ -2,10 +2,14 @@
 
 import json
 import math
+import os
+import re
 import shutil
+import stat
 import subprocess
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,10 +23,19 @@ from pipeline.assets import dictionary_path, yunet_path
 from pipeline.audio import HOP_S, Envelope
 from pipeline.cli import main
 from pipeline.edit import Segment, build_segments, require_valid, validate_project
-from pipeline.media import ffmpeg_bin
+from pipeline.media import ffmpeg_bin, run_ffmpeg
 from pipeline.paths import studio_root
 from pipeline.prep import prep
-from pipeline.project import Project, approve_gate, create_project, file_sha256, load_state, save_state
+from pipeline.project import (
+    Project,
+    _edit_files,
+    approve_gate,
+    create_project,
+    file_sha256,
+    load_project,
+    load_state,
+    save_state,
+)
 from pipeline.script import parse_script
 from pipeline.storyboard import build_storyboard
 from pipeline.style import font_path, load_style
@@ -465,3 +478,133 @@ def gray_index(video: Path, k: int, reference: Path | None = None) -> int:
         return round((luma - 16) / 4)
     table = corner_luma(reference)[:50]
     return int(np.argmin(np.abs(table - luma)))
+
+
+# ---- loudness ----------------------------------------------------------------------------------
+
+
+def loudness(path: Path) -> tuple[float, float]:
+    """(integrated loudness in LUFS, true peak in dBTP) of the sound of `path`, as ffmpeg's ebur128 measures them.
+    The log is written next to `path`."""
+    log = path.with_name(path.name + ".ebur128.log")
+    run_ffmpeg(["-hide_banner", "-nostats", "-i", str(path), "-vn", "-af", "ebur128=peak=true:framelog=quiet",
+                "-f", "null", "-"], log)
+    text = log.read_text(errors="replace")
+    integrated = float(re.findall(r"\bI:\s+(-?[\d.]+) LUFS", text)[-1])
+    peak = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", text)[-1]
+    return integrated, float(peak)
+
+
+# ---- the Meijia stages, built once per session and copied for each test ------------------------
+
+
+@dataclass(frozen=True)
+class Template:
+    """A stage of the Meijia project (default options: no clip_options), built once per session under `root` as a
+    test builds it under its tmp_path (clip/, studio/inbox/<token>/ and studio/projects/<name>/), then made
+    read-only by freeze_template. `modes` holds the mode of every folder and file under the TEMPLATE_PARTS of
+    `root` as the build left it, by path relative to `root`; `rooted` holds the sha256 of every file there that
+    holds the path of `root`, by the same relative path."""
+
+    root: Path
+    name: str
+    modes: dict[str, int]
+    rooted: dict[str, str]
+
+
+TEMPLATE_PARTS = ("clip", "studio")  # what a copy takes of a template's root; home/ is the test's own
+
+
+def _root_marker(root: Path) -> bytes:
+    """The bytes a file holds where it names something under `root`: its path and a separator."""
+    return (str(root) + os.sep).encode("utf-8")
+
+
+def _template_paths(root: Path) -> list[Path]:
+    """Every folder and file under the TEMPLATE_PARTS of `root`, the parts themselves included."""
+    return [path for part in TEMPLATE_PARTS for path in (root / part, *sorted((root / part).rglob("*")))]
+
+
+def freeze_template(root: Path, p: Project) -> Template:
+    """The Template of project `p`, just built under `root`: the modes of its folders and files are noted, the
+    files that hold the path of `root` are found, and then every folder and file is made read-only, so that
+    nothing can write into the template while the session runs (thaw_template undoes it)."""
+    assert root == root.resolve(), f"{root} is not a resolved path"
+    marker = _root_marker(root)
+    modes, rooted = {}, {}
+    for path in _template_paths(root):
+        info = path.lstat()
+        assert stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), f"{path} is neither a folder nor a file"
+        rel = path.relative_to(root).as_posix()
+        modes[rel] = stat.S_IMODE(info.st_mode)
+        if stat.S_ISREG(info.st_mode) and marker in path.read_bytes():
+            rooted[rel] = file_sha256(path)
+    for rel, mode in modes.items():
+        os.chmod(root / rel, mode & ~0o222)
+    return Template(root, p.name, modes, rooted)
+
+
+def thaw_template(template: Template) -> None:
+    """Give the folders and files of `template` back the modes the build left them, as the session ends."""
+    for rel, mode in template.modes.items():
+        os.chmod(template.root / rel, mode)
+
+
+def copy_template(template: Template, root: Path) -> Project:
+    """A project of its own under `root` that stands where `template` stands, for a test whose tmp_path is `root`
+    (REELS_STUDIO must point at root/studio, and the project must not be there yet). The TEMPLATE_PARTS are copied
+    with the modification times of their files (so a step skips on the recorded size and mtime_ns without reading a
+    file again, as in the template) and with the modes the build gave them. Every file that holds the path of the template's root then names `root`
+    instead, and wherever state.json records the content of such a file (the sha256, size and mtime_ns of a step
+    input, the sha256 of an approval or of a validate), it records the new content: so the copy holds no path of
+    the template, and is what building the stage under `root` would have made."""
+    root = root.resolve()
+    assert studio_root() == root / "studio", f"REELS_STUDIO must point at {root / 'studio'}, not {studio_root()}"
+    folder = root / "studio" / "projects" / template.name
+    assert not folder.exists(), f"{folder} exists already: a test gets one stage of the Meijia project, not two"
+    for part in TEMPLATE_PARTS:
+        shutil.copytree(template.root / part, root / part, copy_function=shutil.copy2, dirs_exist_ok=True)
+    for rel, mode in template.modes.items():
+        os.chmod(root / rel, mode)
+    old, new = _root_marker(template.root), _root_marker(root)
+    rewritten = {}  # path in the copy -> (sha256 of the template's file, sha256 of the copy's)
+    for rel, sha256 in template.rooted.items():
+        path = root / rel
+        path.write_bytes(path.read_bytes().replace(old, new))
+        rewritten[str(path)] = (sha256, file_sha256(path))
+    p = load_project(template.name)
+    _record_rewritten(p, rewritten)
+    return p
+
+
+def _record_rewritten(p: Project, rewritten: dict[str, tuple[str, str]]) -> None:
+    """Make state.json of the copy `p` record the new content of each file copy_template rewrote (`rewritten`:
+    path -> (sha256 before, sha256 after)): each step input record of it gets the new sha256, size and mtime_ns,
+    and the approval of a gate and edit_checked, which keep a sha256 by input name, get the new sha256. Each
+    record must have held the content of the template's file."""
+
+    def renewed(path: str, sha256: str) -> str:
+        if path not in rewritten:
+            return sha256
+        before, after = rewritten[path]
+        assert sha256 == before, f"state.json of the template records another content of {path}"
+        return after
+
+    state = load_state(p)
+    assert state["source"]["video"] not in rewritten and state["source"]["script"] not in rewritten
+    for record in state["steps"].values():
+        for entry in record.get("inputs", {}).values():
+            if entry["path"] in rewritten:
+                info = Path(entry["path"]).stat()
+                entry.update(sha256=renewed(entry["path"], entry["sha256"]), size=info.st_size,
+                             mtime_ns=info.st_mtime_ns)
+    storyboard = (state["steps"].get("storyboard") or {}).get("inputs") or {}
+    for gate in state["gates"].values():
+        recorded = gate.get("storyboard_inputs") or {}
+        for name, sha256 in recorded.items():
+            recorded[name] = renewed(storyboard[name]["path"], sha256)
+    if "edit_checked" in state:
+        checked = state["edit_checked"]
+        for name, path in _edit_files(p).items():
+            checked[name] = renewed(str(path), checked[name])
+    save_state(p, state)

@@ -11,18 +11,36 @@ from helpers import real_hf_home
 REAL_HF_HOME = str(real_hf_home(os.environ, Path.home()))
 
 
-@pytest.fixture(autouse=True)
-def isolated_env(tmp_path, monkeypatch):
-    """Keep every test away from the real home folder and the real studio."""
-    fake_home = tmp_path / "home"
+def point_env_at(monkeypatch, root: Path) -> None:
+    """Point HOME and the XDG folders at a fake home under `root`, REELS_STUDIO at `root`/studio, and HF_HOME at the
+    real Hugging Face cache."""
+    fake_home = root / "home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
     monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
     monkeypatch.setenv("XDG_STATE_HOME", str(fake_home / ".local" / "state"))
-    monkeypatch.setenv("REELS_STUDIO", str(tmp_path / "studio"))
+    monkeypatch.setenv("REELS_STUDIO", str(root / "studio"))
     monkeypatch.setenv("HF_HOME", REAL_HF_HOME)
+
+
+@pytest.fixture(autouse=True)
+def isolated_env(tmp_path, monkeypatch):
+    """Keep every test away from the real home folder and the real studio."""
+    point_env_at(monkeypatch, tmp_path)
+
+
+@pytest.fixture(scope="module")
+def module_env(tmp_path_factory):
+    """A folder for what the tests of one module share (a project made once, which they only read), with the
+    environment pointed under it as isolated_env points it for a test, for as long as the module runs. A fixture of
+    the module's scope is made before the isolated_env of the test that first asks for it, so without this it would
+    build in the real home folder and the real studio. Each test still gets its own isolated_env on top."""
+    root = tmp_path_factory.mktemp("module")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        point_env_at(monkeypatch, root)
+        yield root
 
 
 @pytest.fixture(autouse=True)
@@ -84,40 +102,104 @@ def project(inbox_files):
     return create_project(*inbox_files, slug="coffee", date="2026-11-12")
 
 
-@pytest.fixture
-def transcribed_project(tmp_path):
-    """A project made from the Meijia fixture, with prep and transcribe done. The video is a
-    gray-counter clip as long as fixture.wav, with fixture.wav as its sound; the script is the
-    Meijia script.md. transcribe reads the recorded 1.7B result (--asr-json), so no engine runs."""
+def build_template(tmp_path_factory, stage: str, build):
+    """Build a stage of the Meijia project once for the session, as build(root) makes it in a folder of its own
+    under pytest's temp folder, with the environment pointed under that folder as isolated_env points it for a
+    test, and freeze it (helpers.freeze_template); yield the Template, and give it its modes back at the end. A
+    fixture of the session's scope is made before the isolated_env of the test that first asks for it, so without
+    this it would build in the real home folder and the real studio."""
+    from helpers import freeze_template, thaw_template
+
+    from pipeline.paths import studio_root
+
+    root = tmp_path_factory.mktemp(f"meijia-{stage}")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        point_env_at(monkeypatch, root)
+        # checked before anything is written
+        assert studio_root().is_relative_to(root) and Path.home().is_relative_to(root)
+        template = freeze_template(root, build(root))
+    try:
+        yield template
+    finally:
+        thaw_template(template)
+
+
+@pytest.fixture(scope="session")
+def transcribed_template(tmp_path_factory):
+    """The Meijia project with prep and transcribe done, built once per session: the Template that
+    transcribed_project copies. The video is a gray-counter clip as long as fixture.wav, with fixture.wav as its
+    sound; the script is the Meijia script.md. transcribe reads the recorded 1.7B result (--asr-json), so no engine
+    runs."""
     from helpers import meijia_transcribed_project
 
-    return meijia_transcribed_project(tmp_path)
+    yield from build_template(tmp_path_factory, "transcribed", meijia_transcribed_project)
 
 
-@pytest.fixture
-def trimmed_project(transcribed_project):
-    """transcribed_project with the trim step done: work/trim.json exists."""
-    from helpers import trim_project
+@pytest.fixture(scope="session")
+def trimmed_template(tmp_path_factory, transcribed_template):
+    """A copy of transcribed_template with the trim step done: work/trim.json exists."""
+    from helpers import copy_template, trim_project
 
-    return trim_project(transcribed_project)
+    yield from build_template(
+        tmp_path_factory, "trimmed", lambda root: trim_project(copy_template(transcribed_template, root))
+    )
 
 
-@pytest.fixture
-def edited_project(trimmed_project):
-    """trimmed_project with the edit.json that helpers.default_edit makes for its transcript and trims:
+@pytest.fixture(scope="session")
+def edited_template(tmp_path_factory, trimmed_template):
+    """A copy of trimmed_template with the edit.json that helpers.default_edit makes for its transcript and trims:
     every suggested cut is accepted, no extra cut."""
-    from helpers import write_default_edit
+    from helpers import copy_template, write_default_edit
 
-    return write_default_edit(trimmed_project)
+    yield from build_template(
+        tmp_path_factory, "edited", lambda root: write_default_edit(copy_template(trimmed_template, root))
+    )
+
+
+@pytest.fixture(scope="session")
+def approved_template(tmp_path_factory, edited_template):
+    """A copy of edited_template with the storyboard built and gate 1 approved (validate_project, the real
+    build_storyboard and approve_gate): what the render needs."""
+    from helpers import approve_project, copy_template
+
+    yield from build_template(
+        tmp_path_factory, "approved", lambda root: approve_project(copy_template(edited_template, root))
+    )
 
 
 @pytest.fixture
-def approved_project(edited_project):
-    """edited_project with the storyboard built and gate 1 approved (the real build_storyboard and
-    approve_gate): what the render needs."""
-    from helpers import approve_project
+def transcribed_project(tmp_path, transcribed_template):
+    """The test's own copy of transcribed_template (helpers.copy_template), in its tmp_path and its studio: a
+    project made from the Meijia fixture, with prep and transcribe done. The test may change, delete or run
+    anything in it; no other test sees it."""
+    from helpers import copy_template
 
-    return approve_project(edited_project)
+    return copy_template(transcribed_template, tmp_path)
+
+
+@pytest.fixture
+def trimmed_project(tmp_path, trimmed_template):
+    """The test's own copy of trimmed_template: transcribed_project with the trim step done."""
+    from helpers import copy_template
+
+    return copy_template(trimmed_template, tmp_path)
+
+
+@pytest.fixture
+def edited_project(tmp_path, edited_template):
+    """The test's own copy of edited_template: trimmed_project with the edit.json of helpers.default_edit."""
+    from helpers import copy_template
+
+    return copy_template(edited_template, tmp_path)
+
+
+@pytest.fixture
+def approved_project(tmp_path, approved_template):
+    """The test's own copy of approved_template: edited_project with the storyboard built and gate 1 approved,
+    what the render needs."""
+    from helpers import copy_template
+
+    return copy_template(approved_template, tmp_path)
 
 
 @pytest.fixture(scope="session")

@@ -14,9 +14,10 @@ A list item shows its number, where it is in the cut reel (m:ss.s), its kind (a 
 instead), what was said in 「」 (— when nothing was) and, for a candidate, whether edit.json cuts it now.
 An item about a sentence whose captions show the recognised text also shows the caption lines and the
 script's sentence. Each item has one clip, the one review_items gives it, kept inside the audio. An
-item about a candidate, or about a sentence whose captions show the recognised text, that has a note in
-edit.json's notes shows the note after its details; storyboard.md has it as the last indented line of the
-item.
+item about a candidate, or about a sentence of any kind (recognised text, a cut point, a poor match with
+the script), that has a note in edit.json's notes shows the note after its details; storyboard.md has it
+as the last indented line of the item. A note is only Claude's: an item without one shows none, whatever
+the review page would suggest for it.
 
 A clip is played by the one script at the end of the page: a play button holds the clip as a data URI in
 data-clip, and the script decodes it and plays it with Web Audio. The <audio> element does not play in
@@ -256,7 +257,7 @@ def _list_items(items: list[Item], transcript: dict, segments: list[Segment], ca
         if item.kind == "asr_text":
             details = ["字幕：" + " / ".join(line.text for line in captions[item.sentence]),
                        "腳本：" + sentences[item.sentence]["script_text"]]
-        about = item.trim if item.trim is not None else item.sentence if item.kind == "asr_text" else None
+        about = item.trim if item.trim is not None else item.sentence  # a candidate's note, else its sentence's
         shown.append(_ListItem(
             item.number, clock(map_time(item.time, segments)),
             item.label if item.kind == "cut_point" else _ITEM_TEXT[item.kind],

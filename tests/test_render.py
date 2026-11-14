@@ -21,6 +21,7 @@ from helpers import (
     corner_luma,
     force_gate1_open,
     gray_index,
+    loudness,
     meijia_approved_project,
     project_with,
     require_assets,
@@ -40,7 +41,7 @@ from pipeline.edit import Segment
 from pipeline.errors import PipelineError
 from pipeline.media import ffmpeg_bin, ffprobe_bin, ffprobe_json, probe, run_ffmpeg
 from pipeline.prep import prep
-from pipeline.project import gate_ok, load_state, next_step, step_done
+from pipeline.project import gate_ok, load_state, next_step, save_state, step_done
 from pipeline.render import (
     AUDIO_BITRATE,
     LENGTH_TOLERANCE_S,
@@ -638,7 +639,31 @@ def test_render_calls_ffmpeg_in_the_render_folder_with_the_specified_files(appro
     assert args[args.index("-/filter_complex") + 1] == str(work / "filter.txt")
     assert args[-1] == str(p.out / "final.tmp.mp4")
     assert (work / "cut.wav").is_file() and (work / "captions.ass").is_file()
+    sound = args[[i for i, a in enumerate(args) if a == "-i"][1] + 1]
+    assert sound == str(work / "voice.wav") and (work / "voice.wav").is_file()  # the treated voice, not cut.wav
     assert sorted(path.name for path in (work / "fonts").iterdir()) == ["NotoSansTC-Bold.ttf", "NotoSansTC-Regular.ttf"]
+
+
+def test_render_brings_the_voice_to_minus_14_lufs_with_true_peaks_under_minus_1_dbtp(approved_project):
+    """The fixture speech is at -24.9 LUFS; the final, after the voice treatment and the AAC encoder, is at the
+    target, within 1 LU, and its true peak is at or under -1 dBTP."""
+    out = Path(render(approved_project)["out"])
+    integrated, true_peak = loudness(out)
+    assert integrated == pytest.approx(-14.0, abs=1.0)
+    assert true_peak <= -1.0
+
+
+def test_a_render_made_before_the_voice_treatment_is_made_again(approved_project):
+    """A render record of no version (made before the voice treatment) is not done: the next step is render, and
+    render makes the final again instead of skipping it."""
+    p = approved_project
+    render(p)
+    state = load_state(p)
+    del state["steps"]["render"]["version"]
+    save_state(p, state)
+    assert not step_done(p, "render") and next_step(p) == "render"
+    assert render(p)["skipped"] is False
+    assert step_done(p, "render") and next_step(p) == "done"
 
 
 def test_render_fixture_meets_spec(approved_project):
@@ -867,8 +892,9 @@ def plant_old_final(p) -> bytes:
 
 @pytest.mark.parametrize(
     ("owner", "name"),
-    [("pipeline.render", "cut_audio"), ("pipeline.render", "write_ass"), ("shutil", "copyfile")],
-    ids=["cut_audio", "write_ass", "font-copy"],
+    [("pipeline.render", "cut_audio"), ("pipeline.render", "treat_voice"), ("pipeline.render", "write_ass"),
+     ("shutil", "copyfile")],
+    ids=["cut_audio", "treat_voice", "write_ass", "font-copy"],
 )
 def test_a_render_that_fails_early_leaves_no_final_file_of_an_earlier_edit(approved_project, monkeypatch, owner, name):
     """The old file goes before anything else of the render is done, so no early failure keeps it."""

@@ -709,6 +709,18 @@ def test_trim_command_force_runs_again(trimmed_project, capsys):
     assert out["trims"] == 5 and out["suggest_cut"] == 5 and out["needs_listen"] == 1
 
 
+def test_trim_writes_through_a_temp_file_of_its_own(trimmed_project, capsys):
+    """Two runs at once never share a temp file: a trim.json.tmp that is there already is someone else's."""
+    bystander = trimmed_project.work / "trim.json.tmp"
+    bystander.write_text("not ours", encoding="utf-8")
+    capsys.readouterr()
+    assert main(["trim", trimmed_project.name, "--force"]) == 0
+    assert json.loads(capsys.readouterr().out)["skipped"] is False
+    assert bystander.read_text(encoding="utf-8") == "not ours"
+    assert sorted(path.name for path in trimmed_project.work.glob("*.tmp")) == ["trim.json.tmp"]
+    assert json.loads((trimmed_project.work / "trim.json").read_text(encoding="utf-8"))["version"] == 2
+
+
 def test_trim_runs_again_when_the_transcript_changes(trimmed_project, capsys):
     path = trimmed_project.work / "transcript.json"
     doc = json.loads(path.read_text())

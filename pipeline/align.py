@@ -9,7 +9,6 @@ writes the transcript.
 
 import importlib.metadata
 import json
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,7 @@ import soundfile as sf
 
 from pipeline.asr import MODELS, AsrResult, AsrToken, load_asr, transcribe_audio
 from pipeline.errors import PipelineError
-from pipeline.project import FORMAT_VERSIONS, Project, load_state, run_step
+from pipeline.project import FORMAT_VERSIONS, Project, load_state, run_step, write_text_atomically
 from pipeline.script import Marker, Sentence, parse_script
 from pipeline.textnorm import FILLERS, Key, char_key, to_taiwan, unit_alts
 
@@ -846,9 +845,7 @@ def transcribe(p: Project, model_key: str = "1.7b", asr_json: Path | None = None
         result = load_asr(raw, model_id)
         sentences, markers = parse_script(script.read_text(encoding="utf-8"))
         transcript = build_transcript(sentences, markers, result, _audio_seconds(audio16k), fallback_used)
-        temp = out.with_name(out.name + ".tmp")
-        temp.write_text(json.dumps(transcript, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temp, out)
+        write_text_atomically(out, json.dumps(transcript, ensure_ascii=False, indent=2) + "\n")
         return _summary(transcript)
 
     done = run_step(p, "transcribe", inputs, [out], run, force=force)

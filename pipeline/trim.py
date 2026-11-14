@@ -23,7 +23,6 @@ never cut), except for the rounding of the frame grid.
 
 import json
 import math
-import os
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -31,7 +30,7 @@ from collections.abc import Callable
 from pipeline.align import HESITATIONS, LEFT_OUT_OF_ASR_TEXT
 from pipeline.audio import Envelope, envelope, few_pauses, is_silent, noise_floor_db, silence_threshold_db, snap_cut
 from pipeline.errors import PipelineError
-from pipeline.project import FORMAT_VERSIONS, Project, refuse_older_document, run_step
+from pipeline.project import FORMAT_VERSIONS, Project, refuse_older_document, run_step, write_text_atomically
 from pipeline.words import word_ends
 
 Snap = Callable[[float, float, float], float]  # (target time, lowest, highest) -> a cut time
@@ -307,9 +306,7 @@ def trim(p: Project, force: bool = False) -> dict:
             raise PipelineError(f"cannot read {transcript_path}: {error}") from error
         refuse_older_document(transcript_path, transcript, "transcribe", FORMAT_VERSIONS["transcribe"])
         doc = build_trims(transcript, envelope(inputs["audio"]))
-        temp = out.with_name(out.name + ".tmp")
-        temp.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temp, out)
+        write_text_atomically(out, json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
         return _summary(doc)
 
     done = run_step(p, "trim", inputs, [out], run, force=force)

@@ -27,6 +27,7 @@ from pipeline.review_actions import (
     INVISIBLE_TEXT,
     NOTHING_LEFT_TEXT,
     REFUSED_TEXT,
+    TOO_SHORT_TEXT,
     UNDO_FILE,
     ChangeRefused,
     VersionConflict,
@@ -213,6 +214,24 @@ def test_removing_the_last_kept_sentence_is_refused_in_chinese(tmp_path):
     assert edit_stage(p) is None  # the edit.json that was there is still the validated one
 
 
+def test_a_change_that_leaves_only_pieces_too_short_is_refused_with_its_own_text(tmp_path):
+    """A listed candidate t04 covers the whole reel but its first frame: cutting it keeps every sentence and leaves
+    no piece of 2 frames or more, so the text does not say that no sentence would be left."""
+    transcript, trims = transcript_and_trims(SCRIPT, ASR)
+    bounds = trims["bounds"]
+    start, end = bounds["s01"]["cut_in"] + 1 / 30, bounds["s03"]["cut_out"]
+    trims["trims"].append({**trims["trims"][0], "id": "t04", "start": start, "end": end, "suggest": "list"})
+    p = edited_project_from_documents(tmp_path, transcript, trims)  # t04 is listed, so kept by default
+    validate_project(p)
+    before = p.edit_path.read_bytes()
+    with pytest.raises(ChangeRefused) as refused:
+        apply_change(p, edit_version(p), change_cut("t04", True))
+    assert refused.value.message == TOO_SHORT_TEXT == "這樣剪完，留下的每一段都太短，沒辦法輸出，這個改動沒有存。"
+    assert_nothing_written(p, before)
+    assert "no piece of 2 frames or more remains" in log_text(p)
+    assert edit_stage(p) is None
+
+
 def test_any_other_invalid_change_is_refused_in_chinese(tmp_path):
     p, _, _ = project_for(tmp_path)
     before = p.edit_path.read_bytes()
@@ -332,6 +351,40 @@ def test_two_removals_are_both_kept_in_the_record(tmp_path):
     apply_change(p, edit_version(p), change_remove("s03"))
     apply_change(p, edit_version(p), change_remove("s02"))
     assert sorted(undo_file(p)["removed"]) == ["s02", "s03"]
+
+
+def test_the_record_drops_a_sentence_claude_put_back(tmp_path):
+    p, _, _ = project_for(tmp_path)
+    apply_change(p, edit_version(p), change_remove("s02"))
+    edit = load_edit(p.edit_path)  # Claude keeps sentence 2 again by editing edit.json, and validates it
+    edit["cuts"]["extra"] = []
+    edit["sentences"].insert(1, {"id": "s02", "sem": "claim", "weight": "main"})
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    validate_project(p)
+    apply_change(p, edit_version(p), change_remove("s03"))
+    assert undo_file(p)["removed"] == {"s03": {"sentences": [{"id": "s03", "sem": "claim", "weight": "main"}],
+                                               "accepted": []}}
+
+
+def test_the_record_keeps_a_sentence_still_inside_a_wider_range_claude_wrote(tmp_path):
+    transcript, trims = transcript_and_trims("第一句話。今天我們來聊剪輯。第三句話。第四句話。",
+                                             "第一句話今天我們來聊剪輯第三句話第四句話")
+    edit = default_edit(transcript, trims)
+    edit["sentences"][1].update(sem="hook", weight="sub")
+    p = edited_project_from_documents(tmp_path, transcript, trims, edit)
+    validate_project(p)
+    apply_change(p, edit_version(p), change_remove("s02"))
+    saved = undo_file(p)["removed"]["s02"]
+    edit = load_edit(p.edit_path)  # Claude puts sentences 1 and 2 in one range of its own, and validates it
+    edit["cuts"]["extra"] = [{"from": "s01", "to": "s02", "reason": "離題"}]
+    edit["sentences"] = [item for item in edit["sentences"] if item["id"] != "s01"]
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    validate_project(p)
+    apply_change(p, edit_version(p), change_remove("s04"))  # the next write of the record
+    removed = undo_file(p)["removed"]
+    assert sorted(removed) == ["s02", "s04"] and removed["s02"] == saved
+    apply_change(p, edit_version(p), change_restore("s02"))  # the range goes; sentence 2 gets its saved labels
+    assert {"id": "s02", "sem": "hook", "weight": "sub"} in load_edit(p.edit_path)["sentences"]
 
 
 @pytest.mark.parametrize("sid", ["s01", "s99"])
@@ -603,6 +656,17 @@ def test_only_the_characters_the_captions_show_are_checked_against_the_font(tmp_
     p, _, _ = project_for(tmp_path)
     apply_change(p, edit_version(p), change_caption("s02", "今天我們來聊剪接\t"))  # the font has no tab; none shows
     assert load_edit(p.edit_path)["captions"]["text"] == {"s02": "今天我們來聊剪接\t"}
+
+
+def test_a_caption_that_replaces_a_quoted_word_is_saved(tmp_path):
+    """「好」。 becomes 棒, whose place falls on the 「 (no unit's): 棒 takes the unit of 好, so it has a character
+    to show and is saved."""
+    transcript, trims = transcript_and_trims("「好」。今天我們來聊剪輯。", "好今天我們來聊剪輯")
+    p = edited_project_from_documents(tmp_path, transcript, trims)
+    validate_project(p)
+    apply_change(p, edit_version(p), change_caption("s01", "棒"))
+    assert load_edit(p.edit_path)["captions"]["text"] == {"s01": "棒"}
+    assert edit_stage(p) is None
 
 
 @pytest.mark.parametrize("text", ["", "   ", "　", "，。", "**，**"])

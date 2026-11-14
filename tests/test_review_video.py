@@ -1,8 +1,10 @@
 """The review video: work/review.mp4, the render's picture at 540x960 and 30 fps with a key frame every half
 second, and work/audio48k.wav as its sound, so that its times are the transcript's.
 
-Every test builds a project from helpers.edited_project_from_script, whose prep ran on a gray-counter clip
-(frame N has gray 16 + 4 * (N % 50)), so a test can read which source frame a frame of the review video is.
+Every project is one from helpers.edited_project_from_script, whose prep ran on a gray-counter clip (frame N has
+gray 16 + 4 * (N % 50)), so a test can read which source frame a frame of the review video is. The tests that only
+read the review video share one, made once for the module with real ffmpeg (`made`); a test that makes it again,
+removes it or has ffmpeg fail builds a project of its own.
 """
 
 import json
@@ -15,6 +17,7 @@ from media_fixtures import frame_luma
 
 from pipeline.errors import PipelineError
 from pipeline.media import ffprobe_bin, ffprobe_json, probe, run_ffmpeg
+from pipeline.paths import studio_root
 from pipeline.project import step_done
 from pipeline.render import VIDEO_ENCODER
 from pipeline.review_video import (
@@ -47,6 +50,17 @@ def recording(calls: list):
     return run
 
 
+@pytest.fixture(scope="module")
+def made(module_env):
+    """(project, what make_review_video returned, the calls of its runner): the review video of the tests that only
+    read it, made once with real ffmpeg (through `recording`) in the module's own studio."""
+    assert studio_root().is_relative_to(module_env)  # checked before anything is written
+    p = review_project(module_env)
+    calls: list = []
+    result = make_review_video(p, runner=recording(calls))
+    return p, result, calls
+
+
 def streams_of(path: Path) -> dict[str, dict]:
     """The streams of `path` by codec type."""
     return {s["codec_type"]: s for s in ffprobe_json(path, ["-show_streams"], 60)["streams"]}
@@ -76,9 +90,8 @@ def test_the_arguments_are_the_specified_ones():
     ]
 
 
-def test_review_video_is_540x960_at_30_fps_with_sound(tmp_path):
-    p = review_project(tmp_path)
-    result = make_review_video(p)
+def test_review_video_is_540x960_at_30_fps_with_sound(made):
+    p, result, _ = made
     review = review_video_path(p)
     assert review == p.work / "review.mp4"
     assert result == {"video": str(review), "skipped": False}
@@ -91,9 +104,8 @@ def test_review_video_is_540x960_at_30_fps_with_sound(tmp_path):
     assert streams["audio"]["channels"] == 2
 
 
-def test_a_key_frame_at_least_every_half_second(tmp_path):
-    p = review_project(tmp_path)
-    make_review_video(p)
+def test_a_key_frame_at_least_every_half_second(made):
+    p, _, _ = made
     times = key_frame_times(review_video_path(p))
     assert len(times) >= 4  # the clip is a few seconds long
     assert times[0] == pytest.approx(0.0, abs=0.001)
@@ -101,25 +113,21 @@ def test_a_key_frame_at_least_every_half_second(tmp_path):
     assert max(gaps) <= 0.5 + FRAME_S, gaps
 
 
-def test_frame_n_of_the_review_video_is_frame_n_of_the_source(tmp_path):
-    p = review_project(tmp_path)
-    make_review_video(p)
+def test_frame_n_of_the_review_video_is_frame_n_of_the_source(made):
+    p, _, _ = made
     review = review_video_path(p)
     for n in (0, 45, 77):
         assert abs(frame_luma(review, n) - (16 + 4 * (n % 50))) <= 3, n
 
 
-def test_review_video_lasts_as_long_as_the_source_video(tmp_path):
-    p = review_project(tmp_path)
-    make_review_video(p)
+def test_review_video_lasts_as_long_as_the_source_video(made):
+    p, _, _ = made
     duration = json.loads((p.work / "probe.json").read_text(encoding="utf-8"))["duration_s"]
     assert abs(probe(review_video_path(p)).video_duration_s - duration) <= FRAME_S + 0.02
 
 
-def test_the_picture_is_the_video_source_of_probe_json_and_the_sound_is_audio48k(tmp_path):
-    p = review_project(tmp_path)
-    calls: list = []
-    make_review_video(p, runner=recording(calls))
+def test_the_picture_is_the_video_source_of_probe_json_and_the_sound_is_audio48k(made):
+    p, _, calls = made
     (call,) = calls
     inputs = [call["args"][i + 1] for i, arg in enumerate(call["args"]) if arg == "-i"]
     video_source = json.loads((p.work / "probe.json").read_text(encoding="utf-8"))["video_source"]

@@ -1,7 +1,10 @@
+import fcntl
 import json
 import os
 import re
 import stat
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -15,12 +18,14 @@ from pipeline.project import (
     FORMAT_VERSIONS,
     LOCK_FILE,
     PROJECT_BUSY_ERROR,
+    STATE_LOCK_FILE,
     Project,
     ProjectBusy,
     ProjectLock,
     approve_gate,
     create_project,
     done_steps,
+    edit_file_hashes,
     file_sha256,
     first_stale_step,
     gate_ok,
@@ -31,6 +36,7 @@ from pipeline.project import (
     run_step,
     save_state,
     step_done,
+    update_state,
 )
 from pipeline.safe_delete import safe_rmtree
 
@@ -395,6 +401,209 @@ def test_the_lock_of_one_project_leaves_another_project_free(project, inbox_file
     other = create_project(*inbox_files, slug="tea", date="2026-11-12")
     with ProjectLock(project), ProjectLock(other):
         pass
+
+
+# --- writers of state.json at once ---------------------------------------------------------
+
+ROUNDS = 20  # how many times each writer of a race writes state.json
+
+
+def _slow_loads(monkeypatch, seconds=0.002):
+    """Make every load_state wait `seconds` after it has read state.json, so that two writers that load and save it
+    at once without the state lock certainly overlap: the later save drops the other's change."""
+    real = project_module.load_state
+
+    def slow(p):
+        state = real(p)
+        time.sleep(seconds)
+        return state
+
+    monkeypatch.setattr(project_module, "load_state", slow)
+
+
+def _at_once(*jobs):
+    """Run each job in a thread of its own, all at once, and wait for them; the first error a job raised is raised
+    here. A job that has not ended after a minute fails the test (a lock that is never let go)."""
+    errors = []
+
+    def run(job):
+        try:
+            job()
+        except BaseException as error:  # noqa: BLE001 - handed to the test below
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(job,), daemon=True) for job in jobs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
+
+
+def test_two_updates_of_state_json_at_once_lose_neither(project, monkeypatch):
+    _slow_loads(monkeypatch)
+
+    def count(key):
+        def job():
+            for _ in range(ROUNDS):
+                update_state(project, lambda state: state.__setitem__(key, state.get(key, 0) + 1))
+
+        return job
+
+    _at_once(count("page"), count("chat"))
+    state = load_state(project)
+    assert (state["page"], state["chat"]) == (ROUNDS, ROUNDS)
+
+
+def test_update_state_saves_the_change_and_returns_what_it_returns(project):
+    assert update_state(project, lambda state: state.setdefault("note", "咖啡")) == "咖啡"
+    assert load_state(project)["note"] == "咖啡"
+    assert (project.work / STATE_LOCK_FILE).is_file() and STATE_LOCK_FILE == "state.lock"  # never deleted
+
+
+def test_update_state_that_changes_nothing_does_not_write_state(project, monkeypatch):
+    saved = []
+    monkeypatch.setattr(project_module, "save_state", lambda p, state: saved.append(1))
+    update_state(project, lambda state: state.get("steps"))
+    assert saved == []
+
+
+def _state_lock_is_free(project) -> bool:
+    """Whether nobody holds the state lock: an exclusive flock of an open of its own, without waiting, succeeds."""
+    fd = os.open(project.work / STATE_LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_update_state_holds_the_state_lock_only_while_it_changes_state(project):
+    held = update_state(project, lambda state: _state_lock_is_free(project))
+    assert held is False and _state_lock_is_free(project)
+
+
+def test_run_step_runs_fn_without_the_state_lock(project):
+    """A step takes minutes (a render): a validate from the review page must not wait for it."""
+    free = []
+    run_step(project, "s", {}, [], lambda: free.append(_state_lock_is_free(project)) or {})
+    assert free == [True]
+
+
+def test_a_change_that_fails_saves_nothing_and_lets_the_lock_go(project):
+    def broken(state):
+        state["half"] = True
+        raise PipelineError("boom")
+
+    with pytest.raises(PipelineError, match="boom"):
+        update_state(project, broken)
+    assert "half" not in load_state(project)
+    assert _state_lock_is_free(project)
+
+
+def test_update_state_waits_while_another_holder_has_the_state_lock(project):
+    """Another open of the lock file, in this process too, holds the lock: update_state waits, then goes on."""
+    fd = os.open(project.work / STATE_LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    done = threading.Event()
+
+    def update():
+        update_state(project, lambda state: state.__setitem__("note", 1))
+        done.set()
+
+    thread = threading.Thread(target=update, daemon=True)
+    thread.start()
+    try:
+        assert not done.wait(0.3)
+        assert "note" not in load_state(project)
+    finally:
+        os.close(fd)
+    assert done.wait(10)
+    thread.join()
+    assert load_state(project)["note"] == 1
+
+
+def test_the_state_lock_and_the_project_lock_do_not_hold_each_other_up(project):
+    with ProjectLock(project):  # the order is always ProjectLock, then the state lock
+        _at_once(lambda: update_state(project, lambda state: state.__setitem__("under_the_project_lock", 1)))
+
+    def change(state):
+        with ProjectLock(project):  # it does not wait: it would raise ProjectBusy were it the same file
+            state["under_the_state_lock"] = 1
+
+    update_state(project, change)
+    assert load_state(project)["under_the_project_lock"] == load_state(project)["under_the_state_lock"] == 1
+
+
+def _checking(project):
+    """(a job that records ROUNDS validate passes, a check that the last one is in state.json)."""
+
+    def job():
+        for i in range(ROUNDS):
+            project_module.record_edit_checked(project, {"edit": f"e{i}", "transcript": "t", "trim": "t"})
+
+    return job, lambda state: state["edit_checked"]["edit"] == f"e{ROUNDS - 1}"
+
+
+def _approving(project):
+    """(a job that approves gate1 ROUNDS times, a check that the approval is in state.json)."""
+    _finish_early_steps(project)
+    project.edit_path.write_text("{}")
+    run_step(project, "storyboard", {"edit": project.edit_path}, [], lambda: {})
+
+    def job():
+        for _ in range(ROUNDS):
+            approve_gate(project, "gate1")
+
+    return job, lambda state: "gate1" in state["gates"]
+
+
+def _running(project):
+    """(a job that runs ROUNDS steps, each of its own, a check that every one is recorded)."""
+
+    def job():
+        for i in range(ROUNDS):
+            run_step(project, f"a{i:02d}", {}, [], lambda: {})
+
+    return job, lambda state: all(f"a{i:02d}" in state["steps"] for i in range(ROUNDS))
+
+
+def _refreshing(project):
+    """(a job that touches an input of a done step and runs the step ROUNDS times, each a skip that records the new
+    mtime, a check that the last mtime is recorded)."""
+    src = project.work / "in.txt"
+    src.write_text("a")
+    run_step(project, "s", {"in": src}, [], lambda: {})
+
+    def job():
+        for _ in range(ROUNDS):
+            _touch(src)
+            assert run_step(project, "s", {"in": src}, [], lambda: {}) == {"skipped": True}
+
+    return job, lambda state: state["steps"]["s"]["inputs"]["in"]["mtime_ns"] == src.stat().st_mtime_ns
+
+
+@pytest.mark.parametrize("writer", [_checking, _approving, _running, _refreshing],
+                         ids=["record_edit_checked", "approve_gate", "run_step", "skip-refresh"])
+def test_a_writer_of_state_json_and_a_step_at_once_lose_no_update(project, monkeypatch, writer):
+    """A validate on the review page and a step from the chat (other processes; here threads, as each takes the lock
+    through an open of its own) write state.json at the same moment: each loads it again under the state lock, so
+    neither saves over the other's change."""
+    job, written = writer(project)
+    _slow_loads(monkeypatch)
+
+    def steps():
+        for i in range(ROUNDS):
+            run_step(project, f"b{i:02d}", {}, [], lambda: {})
+
+    _at_once(job, steps)
+    state = load_state(project)
+    assert sorted(step for step in state["steps"] if step.startswith("b")) == [f"b{i:02d}" for i in range(ROUNDS)]
+    assert written(state)
 
 
 def test_load_state_of_a_missing_project_folder(tmp_path):
@@ -1199,6 +1408,49 @@ def test_a_malformed_edit_checked_counts_as_a_missing_one(project, malformed):
     assert project_module.project_status(project)["next"] == "validate"
 
 
+def _deleted_when_hashed(monkeypatch, target):
+    """Make the hashing of `target` delete it first: the file goes away after its stat and before it is read."""
+    real = project_module.file_sha256
+
+    def hash_after_the_delete(path):
+        if Path(path) == target:
+            target.unlink()
+        return real(path)
+
+    monkeypatch.setattr(project_module, "file_sha256", hash_after_the_delete)
+
+
+def test_a_file_deleted_between_its_stat_and_its_hash_is_not_there(project, monkeypatch):
+    project.edit_path.write_text("{}")
+    _checked(project)  # transcript.json and trim.json are written too
+    _deleted_when_hashed(monkeypatch, project.edit_path)
+    assert edit_file_hashes(project) == {
+        "edit": None,
+        "transcript": file_sha256(project.work / "transcript.json"),
+        "trim": file_sha256(project.work / "trim.json"),
+    }
+
+
+def test_an_input_deleted_between_its_stat_and_its_hash_is_not_found(project, monkeypatch):
+    src = project.work / "in.txt"
+    src.write_text("a")
+    _deleted_when_hashed(monkeypatch, src)
+    with pytest.raises(PipelineError, match="input 'in' of step 's' not found"):
+        run_step(project, "s", {"in": src}, [], lambda: {})
+
+
+def test_another_error_while_hashing_an_input_goes_on(project, monkeypatch):
+    src = project.work / "in.txt"
+    src.write_text("a")
+
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(project_module, "file_sha256", refuse)
+    with pytest.raises(PermissionError):
+        run_step(project, "s", {"in": src}, [], lambda: {})
+
+
 # --- format versions of transcript.json and trim.json -----------------------------------
 
 
@@ -1208,8 +1460,10 @@ def _set_document_version(path, version):
     path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def test_format_versions_name_the_steps_whose_files_have_one():
-    assert FORMAT_VERSIONS == {"transcribe": 2, "trim": 2}
+def test_format_versions_name_the_steps_that_have_one():
+    """transcribe and trim for the format of their files; render for what it does to the sound (version 2 treats
+    the voice, see pipeline.voice)."""
+    assert FORMAT_VERSIONS == {"transcribe": 2, "trim": 2, "render": 2}
 
 
 def test_a_step_record_without_the_current_format_version_is_not_done(transcribed_project):

@@ -36,6 +36,8 @@ UNCHANGED_EDIT_WARNING = (
     "trim and sentence ids may now point at different candidates"
 )
 MIN_SEGMENT_FRAMES = 2  # a piece shorter than this is dropped after the cuts are taken off
+# What validate_edit says when sentences are kept but every piece the cuts leave is shorter than MIN_SEGMENT_FRAMES.
+NO_PIECE_LEFT_ERROR = f"cuts: nothing is left, no piece of {MIN_SEGMENT_FRAMES} frames or more remains after the cuts"
 
 SEM_TAGS = ("hook", "claim", "number", "list", "compare", "steps", "example", "quote", "define", "warning",
             "cta", "aside")
@@ -504,7 +506,7 @@ def _check_something_is_left(edit: dict, transcript: dict, trims: dict, kept: li
     elif not kept:
         errors.append("cuts.extra: nothing is left, every spoken sentence is removed")
     elif bounds_ok and not build_segments(edit, transcript, trims):
-        errors.append("cuts: nothing is left, no piece of 2 frames or more remains after the cuts")
+        errors.append(NO_PIECE_LEFT_ERROR)
 
 
 # ---- kept sentences and segments --------------------------------------------------------------

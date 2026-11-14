@@ -395,6 +395,56 @@ def test_a_note_in_edit_json_shows_under_its_item_on_the_page_and_in_the_markdow
     assert listen[listen.index(f"   - {NOTE_T05}") - 1].startswith("3. ")
 
 
+NOTE_LOW_MATCH = "建議聽一下這一句。因為講的和腳本差很多，<字幕> 用腳本的字。"
+NOTE_CUT_POINT = "建議聽一下前後。因為切點太靠近字。"
+
+
+def test_a_note_on_a_low_match_sentence_shows_under_its_item_on_the_page_and_in_the_markdown(edited_project):
+    p = edited_project
+    set_cut_listen(p)
+    set_trim_listen(p)
+    transcript = read_json(p, "transcript.json")
+    transcript["sentences"][1].update(needs_listen=True, reasons=["low_match"])
+    write_json(p, "transcript.json", transcript)
+    edit = read_json(p, "edit.json")
+    edit["notes"] = {"s02": NOTE_LOW_MATCH}
+    write_json(p, "edit.json", edit)
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert f'<p class="note">{escape(NOTE_LOW_MATCH)}</p>' in item_li(html, 1) and html.count('class="note"') == 1
+    assert item_lines(html, 1)[-1] == NOTE_LOW_MATCH
+    listen = section(md, "其他要聽的地方")
+    assert listen[0].startswith("1. ") and "吻合度低" in listen[0]
+    assert listen[1:] == [f"   - {NOTE_LOW_MATCH}"]
+
+
+def test_a_note_on_a_sentence_shows_under_its_cut_point_item_too(edited_project):
+    p = edited_project
+    set_cut_listen(p, s01=True)
+    set_trim_listen(p)
+    edit = read_json(p, "edit.json")
+    edit["notes"] = {"s01": NOTE_CUT_POINT}
+    write_json(p, "edit.json", edit)
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert item_lines(html, 1) == ["1 0:00.0 片頭切點「今天我們來聊短影音剪輯。」", NOTE_CUT_POINT]
+    assert section(md, "其他要聽的地方")[-1] == f"   - {NOTE_CUT_POINT}"
+
+
+def test_a_candidate_item_shows_the_note_of_its_candidate_not_the_one_of_its_sentence(edited_project):
+    p = edited_project
+    set_cut_listen(p)
+    edit = read_json(p, "edit.json")
+    sentence = next(t["sentence"] for t in read_json(p, "trim.json")["trims"] if t["id"] == "t05")
+    edit["notes"] = {sentence: NOTE_S03, "t05": NOTE_T05}
+    write_json(p, "edit.json", edit)
+    html = Path(validated_storyboard(p)["html"]).read_text(encoding="utf-8")
+    assert [line for line in plain(item_li(html, 1)).splitlines() if line.strip()][-1] == NOTE_T05
+    assert html.count('class="note"') == 1
+
+
 def test_an_item_without_a_note_shows_none(edited_project):
     result = validated_storyboard(edited_project)
     html = Path(result["html"]).read_text(encoding="utf-8")

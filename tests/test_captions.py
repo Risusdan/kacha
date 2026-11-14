@@ -542,6 +542,10 @@ def test_the_lines_are_the_best_of_every_breaking(monkeypatch, text, words):
     ("差了1,5分", ["差了1,5分"]),
     ("早上10:30開始", ["早上10:30開始"]),
     ("選A;B都可以", ["選A　B都可以"]),
+    ("價格是１,０００元", ["價格是１,０００元"]),  # full-width digits and letters count as ASCII ones (NFKC)
+    ("漲了３.５倍", ["漲了３.５倍"]),
+    ("早上１０:３０開始", ["早上１０:３０開始"]),
+    ("用Ｎｏｄｅ.ｊｓ寫", ["用Ｎｏｄｅ.ｊｓ寫"]),       # the . outside every unit
 ])
 def test_half_width_punctuation(text, lines):
     assert [l.text for l in line_of(text)] == lines
@@ -837,6 +841,91 @@ def test_punctuation_between_two_characters_of_one_unit_stays_in_it():
     assert times(r) == times(U)
 
 
+def test_a_character_typed_after_the_closing_full_stop_shows_after_an_ideographic_space():
+    """啦 joins the unit of 飯, whose span then holds the 。: the line shows it as a separator between two
+    tokens shows, not as written, and the unit keeps its index and its time."""
+    old, new = "我們去吃飯。", "我們去吃飯。啦"
+    spoken = [(1.0 + 0.3 * k, 1.25 + 0.3 * k) for k in range(5)]
+    remapped = remap_units(old, units_of(old, [(k, k + 1) for k in range(5)]), new)
+    assert shown(remapped)[-1] == ("飯。啦", [4, 7])  # the unit's text is the caption text's, as written
+    (line,) = break_lines(new, remapped, FONT, load_style())
+    assert line.text == "我們去吃飯" + captions.SEPARATOR + "啦" and "。" not in line.text
+    assert line.pieces[-1] == Piece("飯" + captions.SEPARATOR + "啦", 4)
+    s = timed_sentence("s01", old, spoken)
+    edit = {"cuts": {"extra": []}, "captions": {"mode": "line", "text": {"s01": new}}}
+    (ev,) = build_events({"sentences": [s]}, edit, [Segment(0.0, 10.0)], FONT, load_style())
+    assert ev.line.text == "我們去吃飯　啦" and ev.times == [pytest.approx(t) for t, _ in spoken]
+
+
+@pytest.mark.parametrize("old, new", [("價格是一千元", "價格是１,０００元"), ("漲了三點五倍", "漲了３.５倍")])
+def test_a_number_of_full_width_digits_in_a_caption_text_shows_as_written(old, new):
+    units = units_of(old, [(k, k + 1) for k in range(len(old))])
+    assert [line.text for line in break_lines(new, remap_units(old, units, new), FONT, load_style())] == [new]
+
+
+@pytest.mark.parametrize("text, line", [
+    ("吃飯。 啦好", "吃飯　啦好"),     # a run of a separator and a space: one ideographic space
+    ("吃飯，、啦好", "吃飯　啦好"),    # a run of separators: one
+    ("吃飯;啦好", "吃飯　啦好"),       # a half-width separator
+    ("吃飯  啦好", "吃飯 啦好"),       # spaces only: one half-width space
+    ("吃Node.js好", "吃Node.js好"),    # signs the sentence text shows as written stay so
+    ("吃10:30好", "吃10:30好"),
+    ("吃1,5好", "吃1,5好"),
+    ("吃飯...好", "吃飯...好"),
+    ("吃飯！「棒」好", "吃飯！「棒」好"),  # marks are no separators: as written
+    ("吃飯。」啦好", "吃飯」啦好"),     # a run before a closing mark goes
+    ("吃飯，！啦好", "吃飯！啦好"),     # and before a terminating one
+    ("吃「，飯好", "吃「飯好"),         # and after an opening one
+])
+def test_a_run_of_separators_and_spaces_inside_a_unit_shows_as_between_two_tokens(text, line):
+    units = units_of(text, [(0, 1), (1, len(text) - 1), (len(text) - 1, len(text))])  # the middle unit holds the run
+    (got,) = break_lines(text, units, FONT, load_style())
+    assert got.text == line
+    assert [(p.text, p.unit) for p in got.pieces] == [(text[0], 0), (line[1:-1], 1), (text[-1], 2)]
+
+
+@pytest.mark.parametrize("blank", ["，", " "])
+@pytest.mark.parametrize("tail", ["", "吧"])
+def test_a_unit_too_wide_for_a_line_is_never_cut_to_a_line_that_starts_or_ends_with_its_inner_blank(blank, tail):
+    """What is typed after 好 joins its unit, which grows wider than a line. The separator or space typed inside
+    it is cut as one between two units is: a line breaks after it, and no line starts or ends with it. That is
+    no word cut. Each piece keeps its share of the unit's characters; the blank's share shows on no line."""
+    caption_dictionary()
+    head, rest = "好這是一個非常非常長的句子", "然後還有更多的字要顯示出來" + tail
+    new = head + blank + rest
+    lines = break_lines(new, remap_units("好", units_of("好", [(0, 1)]), new), FONT, load_style())
+    assert [line.text for line in lines] == [head, rest]
+    assert not any(line.text[0] in (captions.SEPARATOR, " ") or line.text[-1] in (captions.SEPARATOR, " ")
+                   for line in lines)
+    assert not any(line.split_word for line in lines)
+    size = len(new)
+    assert [[(p.unit, p.part) for p in line.pieces] for line in lines] == [
+        [(0, (0.0, len(head) / size))], [(0, ((len(head) + 1) / size, 1.0))]]
+
+
+@pytest.mark.parametrize("blank, breaks_there", [("，", True), (" ", False)])
+def test_after_a_separator_inside_a_wide_unit_is_a_punctuation_break_and_after_a_space_a_plain_one(
+    blank, breaks_there
+):
+    """The blank stands well off the middle of a unit too wide for a line. After a separator the line breaks
+    there, as a punctuation break beats a more even one that is not; after a space the break is a plain one
+    like every other, and the most even of them is taken."""
+    caption_dictionary()
+    head, rest = "好這是一個非常長的句", "然後還有更多的字要顯示出來吧啊"  # 10 and 15 characters
+    new = head + blank + rest
+    lines = [line.text for line in break_lines(new, remap_units("好", units_of("好", [(0, 1)]), new), FONT,
+                                               load_style())]
+    assert len(lines) == 2 and (lines == [head, rest]) == breaks_there
+
+
+def test_a_run_of_separators_inside_a_unit_runs_on_across_a_mark_left_out():
+    new = "大概多成兩，**，**小時"  # once the marks are left out, 兩，，小時: one run
+    remapped = remap_units(OLD, U, new)
+    assert shown(remapped)[-1] == ("兩，**，**小時", [4, 13])
+    (line,) = break_lines(new, remapped, FONT, load_style())
+    assert line.text == "大概多成兩" + captions.SEPARATOR + "小時"
+
+
 def test_a_longer_replacement_is_spread_over_the_old_units():
     r = remap_units(OLD, U, "大概確實有兩小時")  # 多成 (2 characters) becomes 確實有 (3)
     assert shown(r) == [("大概", [0, 2]), ("確實", [2, 4]), ("有", [4, 5]), ("兩小時", [5, 8])]
@@ -847,6 +936,27 @@ def test_a_shorter_replacement_leaves_out_the_units_that_get_no_character():
     r = remap_units(OLD, U, "大概很兩小時")  # 多成 becomes 很: it takes the time of 多
     assert shown(r) == [("大概", [0, 2]), ("很", [2, 3]), ("兩小時", [3, 6])]
     assert times(r) == [times(U)[0], times(U)[1], times(U)[3]]
+
+
+def test_a_replacement_that_starts_on_a_mark_takes_the_unit_of_the_character_it_replaces():
+    old = "「好"
+    units = units_of(old, [(1, 2)])  # only 好 is a unit
+    r = remap_units(old, units, "棒")  # 「好 becomes 棒: the 「 its place falls on holds no unit
+    assert shown(r) == [("棒", [0, 1])] and times(r) == times(units)
+
+
+@pytest.mark.parametrize("old, spans, new, expected", [
+    ("大「「小", [(0, 1), (3, 4)], "甲乙", [("甲", [0, 1]), ("乙", [1, 2])]),  # 乙 falls on the second 「: 小 is nearer
+    ("大「小", [(0, 1), (2, 3)], "甲乙", [("甲乙", [0, 2])]),                 # 乙 falls on the 「: as near, the earlier
+    ("大概「」", [(0, 2)], "大概好", [("大概好", [0, 3])]),                    # no unit in 「」: 好 gets none there
+])
+def test_a_replaced_character_that_falls_on_no_unit_takes_the_nearest_unit_of_the_replaced_range(
+    old, spans, new, expected
+):
+    units = units_of(old, spans)
+    r = remap_units(old, units, new)
+    assert shown(r) == expected
+    assert times(r) == times(units)[:len(expected)]
 
 
 def test_a_character_outside_every_unit_owns_nothing():
@@ -912,6 +1022,18 @@ def test_the_marks_a_caption_text_carries_are_not_shown():
     (ev,) = build_events({"sentences": [s]}, edit, [Segment(0.0, 10.0)], FONT, load_style())
     assert ev.line.text == OLD and "*" not in ev.line.text
     assert ev.times == [pytest.approx(t) for t, _ in spoken]
+
+
+def test_the_marks_a_caption_text_puts_inside_a_unit_are_not_shown():
+    new = "大概多成兩**小**時"  # the marks lie between two characters of 兩小時, inside its span
+    remapped = remap_units(OLD, U, new)
+    assert shown(remapped)[-1] == ("兩**小**時", [4, 11])
+    (line,) = break_lines(new, remapped, FONT, load_style())
+    assert line.text == OLD and "*" not in line.text and line.pieces[-1] == Piece("兩小時", 3)
+    s = timed_sentence("s01", OLD, [(1.0 + 0.3 * k, 1.25 + 0.3 * k) for k in range(7)])
+    edit = {"cuts": {"extra": []}, "captions": {"mode": "line", "text": {"s01": new}}}
+    (ev,) = build_events({"sentences": [s]}, edit, [Segment(0.0, 10.0)], FONT, load_style())
+    assert ev.line.text == OLD
 
 
 @pytest.mark.parametrize("new", ["", "，。", " ", "「」！？", "**，**", "、、、"])

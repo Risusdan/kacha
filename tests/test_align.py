@@ -604,6 +604,18 @@ def test_transcribe_runs_the_engine_and_records_the_fallback(transcribed_project
     assert set(load_state(p)["steps"]["transcribe"]["inputs"]) == {"audio", "script", "asr_model"}
 
 
+def test_transcribe_writes_through_a_temp_file_of_its_own(transcribed_project, capsys):
+    """Two runs at once never share a temp file: a transcript.json.tmp that is there already is someone else's."""
+    p = transcribed_project
+    bystander = p.work / "transcript.json.tmp"
+    bystander.write_text("not ours", encoding="utf-8")
+    assert main(["transcribe", p.name, "--asr-json", str(RECORDED), "--force"]) == 0
+    assert json.loads(capsys.readouterr().out)["skipped"] is False
+    assert bystander.read_text(encoding="utf-8") == "not ours"
+    assert sorted(path.name for path in p.work.glob("*.tmp")) == ["transcript.json.tmp"]
+    assert json.loads((p.work / "transcript.json").read_text(encoding="utf-8"))["version"] == 2
+
+
 def test_transcribe_before_prep_is_an_error(tmp_path, capsys):
     p = project_with(make_clip(tmp_path, seconds=1))
     assert main(["transcribe", p.name, "--asr-json", str(RECORDED)]) == 1

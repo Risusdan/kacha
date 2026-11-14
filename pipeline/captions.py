@@ -4,23 +4,29 @@ A caption is one line of at most 16 characters (a full-width character counts 1,
 0.5, the sum rounded up) that is also no wider than the safe area minus the outline, measured with
 the advance widths of the bold font the render uses. Breaking is done here, never by libass.
 
-Display text: the separators are ，、；：。 and the half-width , ; : and . (outside the units: a number
-such as 1,000 or 3.5 is one unit). Shown as written instead, not as separators: a half-width , : or .
-between two ASCII letters or digits (1,5, 10:30, Node.js), a : right before // (https://), and a . next
-to another one (...). A separator at the end of a line goes, one inside a line becomes an ideographic
-space, and ？ ！ and the quotes and brackets stay. The Markdown marks that survive in a sentence are not
-shown, by the rule parse_script uses (markdown_marks: **x**, __x__, ***x***, ~~x~~, `x`, *x* and a link's
-brackets); a lone * _ or ~ is text (5*3, file_name, 3~5). Spaces between Latin words or numbers and CJK
-stay as one half-width space.
+Display text: the separators are ，、；：。 and the half-width , ; : and . Shown as written instead, not
+as separators: a half-width , : or . between two letters or digits that are ASCII after NFKC (1,5, １,５,
+10:30, Node.js), a : right before // (https://), and a . next to another one (...). A separator at the end
+of a line goes, one inside a line becomes an ideographic space, and ？ ！ and the quotes and brackets stay.
+Inside a unit's span, where a caption text can put one (吃飯。啦: 啦 joins the unit of 飯), a run of
+separators and spaces shows as it would between two units: it goes after an opening mark and before a
+closing or terminating mark (吃飯。」啦 shows 吃飯」啦), and elsewhere is one ideographic space, or one
+half-width space when the run holds no separator. The Markdown marks that survive in a sentence are not
+shown, inside a unit's span either (兩**小**時 as a caption text), by the rule parse_script uses
+(markdown_marks: **x**, __x__, ***x***, ~~x~~, `x`, *x* and a link's brackets); a lone * _ or ~ is text
+(5*3, file_name, 3~5). Spaces between Latin words or numbers and CJK stay as one half-width space.
 
 Where a line may break: after a separator, and after ？ or ！ with the marks and closing quotes that
 follow it (a punctuation break); elsewhere across a space, or where a word ends (words.word_ends of the
 sentence text), but never after an opening mark, before a closing or terminating mark or a separator,
 next to any other sign, or inside a run of Latin letters and digits. Inside a stretch between two
 neighbouring breaks that does not fit a line alone (a long word or address, a CJK run with no word end),
-a line may also break between any two characters; nowhere else is a word cut. A unit cut there has a
-piece on each of its lines, with the share of its characters as its share of the unit's time
-(Piece.part), and a line that starts or ends inside such a stretch has split_word set.
+a line may also break between any two characters; nowhere else is a word cut. A space or separator that
+a unit there shows (see Display text) is cut as one between two units is: a line may break after it (a
+punctuation break after a separator) but not before it, and it goes from the end of a line. A unit cut
+there has a piece on each of its lines, with the share of its characters as its share of the unit's time
+(Piece.part; the share of a space or separator that goes shows on no line), and a line that starts or
+ends inside such a stretch, other than right after such a space or separator, has split_word set.
 
 Of all the ways to break a sentence the one taken is the best by, in this order: the fewest lines; the
 fewest short lines (2 characters wide or less, not counted when the whole sentence is that short: such a
@@ -187,13 +193,15 @@ def width_units(text: str) -> int:
 class _Tok(NamedTuple):
     piece: Piece
     kind: str  # "unit", "open", "close", "term" (？！), "sep" (，、；：。,;: and .), "space" or "other"
-    pos: int  # where it starts in the sentence text
+    pos: int  # where it starts in the sentence text (for a letter of a unit, see _letters)
 
 
 def _kind(text: str, i: int) -> str:
-    """The kind of text[i], a character outside every unit. A half-width comma, colon or full stop between
-    two ASCII letters or digits (1,5, 10:30, Node.js) is no separator but shown as written; so is a colon
-    right before // (https://) and a full stop next to another one (...)."""
+    """The kind of text[i], a character outside every unit (or inside a unit's span: _unit_text). A
+    half-width comma, colon or full stop between two letters or digits that are ASCII after NFKC (1,5,
+    １,５, 10:30, Node.js) is no separator but shown as written, as split_units, which compares after NFKC,
+    keeps １,０００ one number; so is a colon right before // (https://) and a full stop next to another one
+    (...)."""
     c = text[i]
     if c.isspace():
         return "space"
@@ -204,7 +212,7 @@ def _kind(text: str, i: int) -> str:
     if c in _TERMINATORS:
         return "term"
     if c in ",:.":
-        before, after = text[i - 1:i], text[i + 1:i + 2]
+        before, after = (unicodedata.normalize("NFKC", n) for n in (text[i - 1:i], text[i + 1:i + 2]))
         if (_is_word_char(before) and _is_word_char(after)) or (c == ":" and text.startswith("//", i + 1)):
             return "other"
         if c == "." and "." in (before, after):
@@ -214,9 +222,37 @@ def _kind(text: str, i: int) -> str:
     return "other"
 
 
+def _unit_text(text: str, lo: int, hi: int, marks: set[int]) -> str:
+    """What a unit whose span is text[lo:hi] shows: the span as written without the characters of `marks`
+    (the indexes of the Markdown marks of the text), with each run of spaces and separators in it (by _kind
+    on the whole text, so 1,5 10:30 Node.js and ... stay as written) shown as _tidy shows such a run between
+    two tokens: dropped after an opening mark or before a closing or terminating mark, elsewhere one
+    ideographic space if the run holds a separator and one half-width space if not. A caption text puts a
+    mark or a separator inside a unit's span when it puts one between two characters of the unit
+    (remap_units: 吃飯。啦 shows 吃飯　啦, 吃飯。」啦 shows 吃飯」啦, 兩**小**時 shows 兩小時)."""
+    shown = [i for i in range(lo, hi) if i not in marks]
+    kinds = [_kind(text, i) for i in shown]
+    out: list[str] = []
+    k = 0
+    while k < len(shown):
+        if kinds[k] not in ("space", "sep"):
+            out.append(text[shown[k]])
+            k += 1
+            continue
+        j = k
+        while j < len(shown) and kinds[j] in ("space", "sep"):
+            j += 1
+        before = kinds[k - 1] if k else None
+        after = kinds[j] if j < len(shown) else None
+        if before != "open" and after not in ("close", "term"):
+            out.append(SEPARATOR if "sep" in kinds[k:j] else " ")
+        k = j
+    return "".join(out)
+
+
 def _tokens(text: str, units: list[dict]) -> list[_Tok]:
-    """`text` as tokens: one per unit (the text of its span, as written), one per other character.
-    The characters that markdown_marks finds (outside the units) are left out."""
+    """`text` as tokens: one per unit (the text of its span, as _unit_text shows it), one per other
+    character. The characters that markdown_marks finds are left out, inside a unit's span too."""
     by_start = {}
     for index, unit in enumerate(units):
         lo, hi = unit["span"]
@@ -228,7 +264,7 @@ def _tokens(text: str, units: list[dict]) -> list[_Tok]:
     while i < len(text):
         if i in by_start:
             end, index = by_start[i]
-            toks.append(_Tok(Piece(text[i:end], index), "unit", i))
+            toks.append(_Tok(Piece(_unit_text(text, i, end, marks), index), "unit", i))
             i = end
             continue
         if i not in marks:
@@ -369,11 +405,17 @@ def _breaks(toks: list[_Tok], ends: frozenset[int]) -> dict[int, bool]:
 
 
 def _letters(tok: _Tok) -> list[_Tok]:
-    """`tok` as one token per character, each with its share of the unit's characters as `part`."""
+    """`tok` as one token per character, each with its share of the unit's characters as `part`. The
+    ideographic or half-width space that _unit_text made of a run inside a unit is a "sep" or "space"
+    token, as that run is between two tokens, so that _trim takes it off the end of a line. A letter's pos is
+    the unit's pos plus its place in the text the unit shows, which is its place in the sentence text only
+    while the unit shows its span as written (no run made one space, no mark left out); nothing reads the pos
+    of a letter."""
     size = len(tok.piece.text)
     if size == 1:
         return [tok]
-    return [_Tok(Piece(c, tok.piece.unit, (k / size, (k + 1) / size)), tok.kind, tok.pos + k)
+    blanks = {SEPARATOR: "sep", " ": "space"} if tok.kind == "unit" else {}
+    return [_Tok(Piece(c, tok.piece.unit, (k / size, (k + 1) / size)), blanks.get(c, tok.kind), tok.pos + k)
             for k, c in enumerate(tok.piece.text)]
 
 
@@ -383,7 +425,11 @@ def _split_wide(
     """`toks` with every stretch between two neighbouring breaks that does not fit a line alone made into
     one token per character, with a break between every two of them: (the tokens, the breaks as indexes
     into them, the breaks inside such stretches). A break inside is not a punctuation break; which of
-    them are taken is left to _best_bounds, with all the other breaks. A stretch that fits is never cut."""
+    them are taken is left to _best_bounds, with all the other breaks. A stretch that fits is never cut.
+
+    A space or separator from inside a unit (_letters) is cut as one between two tokens is: no break
+    before it, and the break after it is no break inside the stretch (no word is cut there), a punctuation
+    break if it is a separator."""
     bounds = [0, *sorted(breaks), len(toks)]
     out: list[_Tok] = []
     moved: dict[int, bool] = {}
@@ -397,10 +443,13 @@ def _split_wide(
             continue
         lo, hi = _shown_bounds(stretch)
         out.extend(stretch[:lo])
+        after = None  # the kind of the letter before when it is a space or a separator
         for k, tok in enumerate(t for tok in stretch[lo:hi] for t in _letters(tok)):
-            if k:
-                moved[len(out)] = False
-                inside.add(len(out))
+            if k and tok.kind not in ("space", "sep"):
+                moved[len(out)] = after == "sep"
+                if after is None:
+                    inside.add(len(out))
+            after = tok.kind if tok.kind in ("space", "sep") else None
             out.append(tok)
         out.extend(stretch[hi:])
     return out, moved, inside
@@ -511,8 +560,10 @@ def remap_units(old: str, units: list[dict], new: str) -> list[dict]:
     show when the old ones were spoken. `old` and `new` are compared character by character
     (difflib.SequenceMatcher). A character of `new` that is kept belongs to the unit of its old character.
     Where old[i1:i2] is replaced by new[j1:j2], the k-th new character belongs to the unit of the old
-    character i1 + k * (i2 - i1) // (j2 - j1), so the old units are spread over the new characters. An
-    inserted character belongs to none yet.
+    character i1 + k * (i2 - i1) // (j2 - j1), so the old units are spread over the new characters; when no
+    unit holds that character (an opening mark, a symbol, a space), to the unit of the nearest character of
+    old[i1:i2] that one holds, the earlier of two as near (「好 replaced by 棒: 棒 takes the unit of 好), and
+    to none yet when no character of old[i1:i2] has a unit. An inserted character belongs to none yet.
 
     Four kinds of character stay no unit's: a space or a punctuation mark (a _kind other than "other"), a
     Markdown mark of `new` (markdown_marks: the captions do not show it), and a kept character that no
@@ -532,8 +583,12 @@ def remap_units(old: str, units: list[dict], new: str) -> list[dict]:
             owner[j1:j2] = owner_of_old[i1:i2]
             bare.update(j1 + k for k in range(i2 - i1) if owner_of_old[i1 + k] is None)
         elif tag == "replace":
+            held = [i for i in range(i1, i2) if owner_of_old[i] is not None]
             for k in range(j2 - j1):
-                owner[j1 + k] = owner_of_old[i1 + (k * (i2 - i1)) // (j2 - j1)]
+                i = i1 + (k * (i2 - i1)) // (j2 - j1)
+                if owner_of_old[i] is None and held:
+                    i = min(held, key=lambda h: (abs(h - i), h))  # the nearest, the earlier of two as near
+                owner[j1 + k] = owner_of_old[i]
     bare.update(j for j in range(len(new)) if _kind(new, j) != "other")
     for j in bare:
         owner[j] = None

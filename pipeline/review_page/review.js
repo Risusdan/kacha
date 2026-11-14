@@ -1,61 +1,86 @@
-// The review page: the DOM and the requests to the review server (pipeline/review_server.py). The pure functions
-// (times on the source and on the reel, the caption on screen) are in logic.js.
+// The review page: the views, the player and the requests to the review server (pipeline/review_server.py), and the
+// start of it all. The script is four modules, which index.html does not load one by one: this one imports the
+// others, and a module that is imported never imports this one. logic.js holds the pure functions (times on the
+// source and on the reel, the caption on screen), shared.js the page's state, the requests and the notice, and
+// editor.js the caption editor. Only this module binds the page to the DOM and starts it (start, the last thing it
+// does), so the others can be imported with no page.
 //
 // The page loads GET api/data (review_data.page_data: segments and the transcript in source seconds, captions on the
-// reel) and asks GET api/state every POLL_MS. It plays the review video, which is the whole source, and skips what
-// the edit cuts: on every frame (requestVideoFrameCallback, on the time of the frame on screen, a frame ahead) and on
-// every timeupdate it asks skipTarget where to go. Every change goes to POST api/change with the version of the edit
-// the page shows; the page then loads the data again. A version the page did not cause (Claude changed the edit from
-// the chat) loads the data again with a notice: pollVersion decides. While a change or the approval is on its way,
-// the buttons that change something are disabled and no poll goes out. Once the state is working, approved or done,
-// the page shows that state and offers no change. The caption editor (its own section) changes a sentence's caption
-// text: it asks POST api/caption-lines for the lines as the user types and saves through api/change.
+// reel, and the state with its step, error text and outputs, which the first view shows) and asks GET api/state
+// every POLL_MS. It plays the review video, which is the whole source, and skips what the edit cuts: on every frame
+// (requestVideoFrameCallback, on the time of the frame on screen, a frame ahead) and on every timeupdate it asks
+// skipTarget where to go. Every change goes to POST api/change with the version of the edit the page shows; the page
+// then loads the data again. A version the page did not cause (Claude changed the edit from the chat) loads the data
+// again with a notice: pollVersion decides. While a change or the approval is on its way, the buttons that change
+// something are disabled and no poll goes out. Once the state is working, approved or done, the page shows that
+// state and offers no change. The caption editor (editor.js) changes a sentence's caption text: it asks POST
+// api/caption-lines for the lines as the user types and saves through sendChange, below.
 //
-// Everything the page shows is Chinese and comes either from this file or from the server's data and answers; ids
-// travel only in data attributes and in the bodies of requests. URLs are relative: the server answers on one port.
+// Everything the page shows is Chinese and comes either from the page's modules or from the server's data and
+// answers; ids travel only in data attributes and in the bodies of requests. URLs are relative: the server answers
+// on one port.
 
 import {
   captionAt,
-  captionToSave,
-  changedRuns,
   clock,
   leadIn,
   litPieces,
   nearestUnit,
+  pageState,
   placePopover,
+  playerClock,
   pollVersion,
-  previewLine,
   reelTime,
   seekPoint,
   sentenceAt,
   skipTarget,
   sourceTime,
 } from "./logic.js";
+import {
+  $,
+  EDITING,
+  SERVER_ERROR_TEXT,
+  Stopped,
+  button,
+  canChange,
+  editable,
+  el,
+  errorText,
+  notify,
+  onServerGone,
+  page,
+  request,
+  rowOf,
+} from "./shared.js";
+import {
+  UNSAVED_CAPTION_TEXT,
+  closeEditor,
+  connectEditor,
+  dropEditor,
+  editorLine,
+  notifyUnlessDropped,
+  openEditor,
+  placeEditor,
+  unsavedText,
+} from "./editor.js";
 
 const POLL_MS = 3000;
 const FRAME_S = 1 / 30; // the lookahead of the skip on a frame: one frame of the review video
-const NOTICE_MS = 4000;
-const ERROR_MS = 10000; // an error stays this long
 const LEAD_S = 1; // going to an item leaves the video this many reel seconds before it
 const AROUND_S = 1; // ▶ 播這一段前後 plays this many reel seconds before and after the item
 const SLOW_RATE = 0.5;
-const PREVIEW_MS = 300; // the caption editor asks for the lines this long after the typing stops
 const SEEN_KEY = "review-seen:"; // + the project: the items opened in this tab (sessionStorage)
 
-// The texts of review_server.py, word for word: the page shows them itself when the server cannot answer, or
-// answers with something the page cannot read.
+// The texts of review_server.py, word for word (SERVER_ERROR_TEXT is in shared.js): the page shows them itself when
+// the server cannot answer.
 const DENIED_TEXT = "審閱頁的程式已經停了，請回對話請 Claude 重新打開。";
-const SERVER_ERROR_TEXT = "審閱頁的程式出了問題，請回對話請 Claude 看看。";
 const UPDATED_TEXT = "Claude 改了剪接設定，頁面已更新。";
 const SUGGESTED = "（建議）";
 const PLAY_TEXT = "▶ 播放";
 const PAUSE_TEXT = "❚❚ 暫停";
-const UNSAVED_CAPTION_TEXT = "改的字幕還沒存，先按「儲存」或「取消」，再按同意。"; // 同意 while the editor has text to save
 const STEPS = ["storyboard", "approve", "render"]; // the steps of the approval job, in order
 const STEP_TEXTS = { storyboard: "正在重做分鏡稿", approve: "正在記下同意", render: "正在輸出成品" };
-const EDITING = ["editing", "failed"]; // the states in which the page changes the edit
 
-const $ = (id) => document.getElementById(id);
 const video = $("video");
 const player = $("player");
 const captionBox = $("caption");
@@ -66,103 +91,7 @@ const sentencesBox = $("sentences");
 const pop = $("pop");
 const confirmDialog = $("confirm");
 
-const page = {
-  data: null, // the last GET api/data
-  trims: new Map(), // candidate id -> its row of data.trims
-  sentences: new Map(), // sentence id -> its row of data.sentences
-  state: null, // the state of the last GET api/state: editing, failed, working, approved or done
-  step: null,
-  outputs: null,
-  failedText: null,
-  waitText: null, // why the data could not be loaded (Claude is changing the edit)
-  needsLoad: false, // the last load failed: load again on the next poll
-  loadSeq: 0, // the number of the last load; an answer to an older one is dropped
-  ownVersion: null, // the version this page's last change made, until a poll has seen it or another one loads
-  confirmVersion: null, // the version the open confirm dialog was built from: the one the approval is for
-  changes: 0, // goes up when a change or the approval starts and when it lands: a poll that saw it go up is outdated
-  busy: false, // a change or the approval is on its way
-  previewSet: false, // the done view's video has its source
-  stopped: false, // the server is gone: no more requests
-  seen: new Set(), // the items whose card was opened
-  seenLoaded: false,
-  at: { decision: -1, listen: -1, asr: -1 }, // where the navigation is in each list
-  pop: null, // the open popover: {kind: "trim" | "typo" | "menu", id}, or {kind: "listen", id, which, start}
-  editor: null, // the open caption editor (see openEditor)
-  numbered: new Set(), // the decisions whose number the transcript shows already (while it is built)
-  stopAtReel: null, // a clip plays until this reel time
-  shown: { caption: null, lit: -1 }, // what the caption box shows
-  nowSentence: null, // the sentence lit as playing
-  pollTimer: null,
-  noticeTimer: null,
-};
-
-class Stopped extends Error {} // the server did not answer, or refused the key: the banner says so
-
-// ---- building elements ------------------------------------------------------------------------
-
-// An element with `props` (class, data, style, disabled, hidden, or any attribute) and `children` (nodes or text).
-function el(tag, props = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (value === null || value === undefined) continue;
-    if (key === "class") node.className = value;
-    else if (key === "data") {
-      for (const [name, item] of Object.entries(value)) if (item !== null && item !== undefined) node.dataset[name] = item;
-    } else if (key === "style") Object.assign(node.style, value);
-    else if (key === "disabled" || key === "hidden") node[key] = Boolean(value);
-    else node.setAttribute(key, String(value));
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    node.append(child instanceof Node ? child : String(child));
-  }
-  return node;
-}
-
-function button(text, props, onClick) {
-  const node = el("button", { type: "button", class: "btn", ...props }, text);
-  node.addEventListener("click", onClick);
-  return node;
-}
-
-// ---- requests ---------------------------------------------------------------------------------
-
-// {status, body} of a request to the server. A request that gets no answer, or 403 (the key is gone), means the
-// server is gone: the banner says so, polling stops, and Stopped is thrown. A body that is not JSON is {}.
-async function request(method, url, body) {
-  if (page.stopped) throw new Stopped();
-  const init = { method, cache: "no-store" };
-  if (body !== undefined) {
-    init.headers = { "Content-Type": "application/json" };
-    init.body = JSON.stringify(body);
-  }
-  let response;
-  try {
-    response = await fetch(url, init);
-  } catch (error) {
-    serverGone();
-    throw new Stopped();
-  }
-  if (response.status === 403) {
-    serverGone();
-    throw new Stopped();
-  }
-  let answer = {};
-  if (response.status !== 204) {
-    try {
-      answer = await response.json();
-    } catch (error) {
-      answer = {};
-    }
-  }
-  return { status: response.status, body: answer !== null && typeof answer === "object" ? answer : {} };
-}
-
-// The Chinese text of a refusal: the server's "error", or SERVER_ERROR_TEXT when there is none.
-function errorText(answer) {
-  const text = answer.body.error;
-  return typeof text === "string" && text !== "" ? text : SERVER_ERROR_TEXT;
-}
+// ---- the server and its data ------------------------------------------------------------------
 
 function serverGone() {
   if (page.stopped) return;
@@ -197,8 +126,9 @@ async function loadData() {
     confirmDialog.close();
     page.confirmVersion = null;
   }
-  // the first view follows the state that came with the data; after that the polls say it, with its step and outputs
-  if (page.state === null && typeof page.data.state === "string") page.state = page.data.state;
+  // the first view follows the state that came with the data, with its step, error text and outputs, as applyStatus
+  // takes them from a poll; after that the polls say it
+  if (page.state === null && typeof page.data.state === "string") Object.assign(page, pageState(page.data));
   page.trims = new Map(page.data.trims.map((trim) => [trim.id, trim]));
   page.sentences = new Map(page.data.sentences.map((sentence) => [sentence.id, sentence]));
   if (!page.seenLoaded) loadSeen();
@@ -231,7 +161,7 @@ function markSeen(id) {
   renderNav();
 }
 
-// ---- the banner and the notice ----------------------------------------------------------------
+// ---- the banner -------------------------------------------------------------------------------
 
 function renderBanner() {
   const banner = $("banner");
@@ -243,35 +173,7 @@ function renderBanner() {
   banner.hidden = text === null;
 }
 
-function notify(text, isError = false) {
-  const notice = $("notice");
-  notice.textContent = text;
-  notice.classList.toggle("error", isError);
-  notice.hidden = false;
-  clearTimeout(page.noticeTimer);
-  page.noticeTimer = setTimeout(() => {
-    notice.hidden = true;
-  }, isError ? ERROR_MS : NOTICE_MS);
-}
-
-// Hide the notice now if it shows `text`, which no longer holds; any other notice stays until its own time.
-function hideNotice(text) {
-  const notice = $("notice");
-  if (notice.hidden || notice.textContent !== text) return;
-  clearTimeout(page.noticeTimer);
-  notice.hidden = true;
-}
-
 // ---- the views --------------------------------------------------------------------------------
-
-function editable() {
-  return !page.stopped && page.data !== null && EDITING.includes(page.state);
-}
-
-// Whether a button that changes something works now: the edit can be changed and nothing is on its way.
-function canChange() {
-  return editable() && !page.busy;
-}
 
 // The buttons that change something (data-change, the 同意 button and the confirm dialog's) follow canChange.
 function refreshControls() {
@@ -300,7 +202,7 @@ function renderView() {
   $("done").hidden = page.state !== "done";
   if (!editing) {
     closePop();
-    closeEditor();
+    dropEditor();
     if (confirmDialog.open) confirmDialog.close();
     video.pause();
   }
@@ -345,7 +247,7 @@ async function reveal() {
 function renderTop() {
   const data = page.data;
   $("project").textContent = data.project;
-  $("lengths").textContent = `原長 ${clock(data.source_s)} → 新長 ${clock(data.duration_s)}`;
+  $("lengths").textContent = `原長 ${data.source_clock} → 新長 ${data.duration_clock}`;
   $("cuts").textContent = `剪掉 ${data.cuts} 段`;
 }
 
@@ -516,7 +418,7 @@ function showTime() {
   const data = page.data;
   const t = video.currentTime;
   const r = reelTime(t, data.segments);
-  $("clock").textContent = `${clock(r)} / ${clock(data.duration_s)}`;
+  $("clock").textContent = `${playerClock(t, data.segments, data.duration_s, data.duration_clock)} / ${data.duration_clock}`;
   playhead.style.left = `${Math.min(100, (t / (data.source_s || 1)) * 100)}%`;
   showCaption(r);
   showSentence(t);
@@ -583,7 +485,7 @@ function renderTrack() {
   const asked = data.trims.filter((trim) => trim.decision).map((trim) => bar("ask", trim.start, trim.end));
   track.replaceChildren(...kept, ...asked, playhead);
   $("track-start").textContent = clock(0);
-  $("track-end").textContent = clock(data.duration_s);
+  $("track-end").textContent = data.duration_clock;
 }
 
 function seekOnTrack(event) {
@@ -594,10 +496,6 @@ function seekOnTrack(event) {
 }
 
 // ---- the transcript ---------------------------------------------------------------------------
-
-function rowOf(id) {
-  return sentencesBox.querySelector(`.sentence[data-sentence="${CSS.escape(id)}"]`);
-}
 
 function trimAnchor(id) {
   return sentencesBox.querySelector(`[data-trim="${CSS.escape(id)}"]`);
@@ -891,7 +789,7 @@ function typoCard(sentence) {
 function listenCard(item) {
   const sentence = page.sentences.get(item.sentence);
   return [
-    el("h4", {}, `${clock(reelTime(item.start, page.data.segments))}　「${quoted(sentence.text)}」`),
+    el("h4", {}, `${item.time}　「${quoted(sentence.text)}」`),
     el("div", { class: "rec" }, item.note),
     el("div", { class: "row" }, button("▶ 播這一段前後", {}, () => playSpan(item.start, item.end, AROUND_S))),
   ];
@@ -922,181 +820,6 @@ function onPointerDown(event) {
   closePop();
 }
 
-// ---- the caption editor -----------------------------------------------------------------------
-
-// Open the caption editor of the kept sentence `id` in place of its row: what the sentence says (recognised, or the
-// script's; read only), the field with the characters that differ from that in green (changedRuns), the lines the
-// server would break the text into (askLines, PREVIEW_MS after the typing stops, not while an input method is
-// composing), and 儲存, 取消, 復原成原本的字, ▶ 播這一句. The video holds at the sentence, and while the editor is
-// open the caption over it shows those lines (editorLine). One editor is open at a time.
-function openEditor(id) {
-  const sentence = page.sentences.get(id);
-  if (!sentence || sentence.state !== "kept") return;
-  closeEditor();
-  closePop();
-  const input = el("input", { type: "text", class: "field-input", spellcheck: "false", autocomplete: "off",
-    "aria-label": "字幕要顯示的字" });
-  input.value = sentence.caption;
-  const editor = {
-    id, input, original: sentence.original, saved: sentence.caption, lines: null, seq: 0, timer: null, composing: false,
-    loaded: page.data, // the data the lines were asked with: a later load asks again (placeEditor)
-    marks: el("div", { class: "field-marks", "aria-hidden": "true" }),
-    linesBox: el("div", { class: "lines" }),
-  };
-  const said = sentence.recognised ? "講了什麼（辨識的結果）" : "原本的字幕（取自腳本）";
-  editor.node = el("div", { class: "edit" },
-    el("div", { class: "lbl" }, `${sentence.time}　${said}`),
-    el("div", { class: "heard" }, sentence.original),
-    el("div", { class: "lbl" }, "字幕要顯示"),
-    el("div", { class: "field" }, editor.marks, input),
-    el("div", { class: "lbl" }, "會斷成這幾行"),
-    editor.linesBox,
-    el("div", { class: "row" },
-      button("儲存", { class: "btn primary", data: { change: "" }, disabled: !canChange() }, () => saveEditor(editor)),
-      button("取消", {}, closeEditor),
-      button("復原成原本的字", {}, () => {
-        input.value = editor.original;
-        onEditorInput(editor);
-      }),
-      button("▶ 播這一句", {}, () => {
-        const now = page.sentences.get(id);
-        if (now) playSpan(now.start, now.end, 0);
-      })),
-    el("div", { class: "note" }, "改過的字用綠色標出來。字幕出現的時間照講話的時間；新加的字借旁邊的字的時間。"));
-  input.addEventListener("input", () => onEditorInput(editor));
-  input.addEventListener("compositionstart", () => {
-    editor.composing = true;
-  });
-  input.addEventListener("compositionend", () => {
-    editor.composing = false;
-    onEditorInput(editor);
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) saveEditor(editor);
-  });
-  for (const name of ["scroll", "keyup", "mouseup", "select"]) {
-    input.addEventListener(name, () => {
-      editor.marks.scrollLeft = input.scrollLeft;
-    });
-  }
-  page.editor = editor;
-  placeEditor(null);
-  showMarks(editor);
-  showInPanel(editor.node, false);
-  input.focus({ preventScroll: true });
-  input.setSelectionRange(input.value.length, input.value.length);
-  holdAt(sentence.start);
-  askLines(editor);
-}
-
-// Put the open editor in place of its sentence's row (again each time the transcript is drawn), with the focus and
-// the selection `caret` ([start, end]) back in its field when it had them; close it when the sentence is not in the
-// reel any more, or its own text changed (it was transcribed again). The caption it compares the field with is the
-// one the data now holds (Claude may have changed it); data loaded since the lines were asked asks them again (the
-// style may have changed, or the edit become ready). A redraw takes the field out of the page, which can end an
-// input method's composition without a compositionend.
-function placeEditor(caret) {
-  const editor = page.editor;
-  if (editor === null) return;
-  const row = rowOf(editor.id);
-  const sentence = page.sentences.get(editor.id);
-  if (sentence?.state !== "kept" || sentence.original !== editor.original || !row) {
-    closeEditor();
-    return;
-  }
-  editor.saved = sentence.caption;
-  editor.composing = false;
-  row.hidden = true;
-  row.after(editor.node);
-  if (caret) {
-    editor.input.focus({ preventScroll: true });
-    editor.input.setSelectionRange(...caret);
-  }
-  if (editor.loaded !== page.data) {
-    editor.loaded = page.data;
-    askLines(editor);
-  }
-}
-
-function closeEditor() {
-  const editor = page.editor;
-  if (editor === null) return;
-  page.editor = null;
-  clearTimeout(editor.timer);
-  editor.node.remove();
-  const row = rowOf(editor.id);
-  if (row) row.hidden = false;
-  refreshCaption();
-}
-
-// The field's backdrop: the field's text with the changed characters marked, scrolled as the field is.
-function showMarks(editor) {
-  editor.marks.replaceChildren(...changedRuns(editor.original, editor.input.value).map((run) => (
-    run.changed ? el("mark", {}, run.text) : run.text)));
-  editor.marks.scrollLeft = editor.input.scrollLeft;
-}
-
-function onEditorInput(editor) {
-  showMarks(editor);
-  clearTimeout(editor.timer);
-  if (!editor.composing) editor.timer = setTimeout(() => askLines(editor), PREVIEW_MS);
-}
-
-// Ask the server for the lines of the field's text, and show them, or why the text would not be saved (the caption
-// over the video then shows the saved caption). An answer that comes after a later question was asked, or after the
-// editor closed, is dropped: it is for older text.
-async function askLines(editor) {
-  clearTimeout(editor.timer);
-  editor.seq += 1;
-  const seq = editor.seq;
-  let lines = null;
-  let refusal = SERVER_ERROR_TEXT;
-  try {
-    const answer = await request("POST", "api/caption-lines", { sentence: editor.id, text: editor.input.value });
-    if (answer.status === 200 && Array.isArray(answer.body.lines)) lines = answer.body.lines.map(String);
-    else refusal = errorText(answer);
-  } catch (error) {
-    if (error instanceof Stopped) return; // the banner says so
-  }
-  if (page.editor !== editor || seq !== editor.seq) return;
-  editor.lines = lines;
-  editor.linesBox.replaceChildren(...(lines === null ? [el("div", { class: "error" }, refusal)]
-    : lines.map((line) => el("span", {}, line))));
-  refreshCaption();
-}
-
-// Save the field's text as the sentence's caption text, or null when it is the sentence's own text again; nothing
-// goes out when it is the caption already (captionToSave). Saved: the editor closes, and so does the notice that
-// it had text to save (UNSAVED_CAPTION_TEXT), if it still shows. Refused: it stays open, and the notice says why.
-async function saveEditor(editor) {
-  if (page.editor !== editor || !canChange()) return;
-  const text = textToSave(editor);
-  if (text === undefined) {
-    closeEditor();
-    hideNotice(UNSAVED_CAPTION_TEXT);
-    return;
-  }
-  const saved = await sendChange({ type: "caption", sentence: editor.id, text });
-  if (saved && page.editor === editor) {
-    closeEditor();
-    hideNotice(UNSAVED_CAPTION_TEXT);
-  }
-}
-
-function textToSave(editor) {
-  return captionToSave(editor.input.value, editor.saved, editor.original);
-}
-
-// The line of the open editor on screen at reel time `r`: its lines share the sentence's time in the reel
-// (previewLine); null elsewhere, and while the editor has no lines to show.
-function editorLine(r) {
-  const editor = page.editor;
-  const sentence = editor !== null && editor.lines !== null ? page.sentences.get(editor.id) : null;
-  if (!sentence) return null;
-  const segments = page.data.segments;
-  return previewLine(r, reelTime(sentence.start, segments), reelTime(sentence.end, segments), editor.lines);
-}
-
 // ---- changes ----------------------------------------------------------------------------------
 
 // Send a change with the version the page shows. Done: the data loads again (with the notice when it is not the
@@ -1113,10 +836,12 @@ async function sendChange(change) {
       done = true;
       const made = answer.body.version;
       page.ownVersion = made;
-      if ((await loadData()) && page.data.version !== made) notify(UPDATED_TEXT);
+      const drops = page.drops;
+      if ((await loadData()) && page.data.version !== made) notifyUnlessDropped(drops, UPDATED_TEXT);
     } else {
+      const drops = page.drops;
       if (answer.status === 409 && answer.body.conflict === true) await loadData();
-      notify(errorText(answer), true);
+      notifyUnlessDropped(drops, errorText(answer), true);
       if (answer.status === 423) await checkState();
     }
   } catch (error) {
@@ -1139,7 +864,7 @@ function openConfirm() {
   if (!canChange()) return;
   closePop();
   const editor = page.editor;
-  if (editor !== null && textToSave(editor) !== undefined) {
+  if (editor !== null && unsavedText(editor)) {
     notify(UNSAVED_CAPTION_TEXT, true);
     showInPanel(editor.node, false);
     editor.input.focus({ preventScroll: true });
@@ -1149,7 +874,7 @@ function openConfirm() {
   const data = page.data;
   page.confirmVersion = data.version;
   const body = $("confirm-body");
-  body.replaceChildren(el("p", {}, `新長 ${clock(data.duration_s)}，剪掉 ${data.cuts} 段。`));
+  body.replaceChildren(el("p", {}, `新長 ${data.duration_clock}，剪掉 ${data.cuts} 段。`));
   const unseen = data.nav.decisions.filter((id) => !page.seen.has(id)).map((id) => page.trims.get(id)).filter(Boolean);
   if (unseen.length > 0) {
     body.append(
@@ -1205,12 +930,10 @@ async function applyStatus(status, outdated = false) {
   });
   page.ownVersion = decided.own;
   if (outdated) return;
-  if (decided.load && (await loadData()) && decided.notice) notify(UPDATED_TEXT);
+  const drops = page.drops;
+  if (decided.load && (await loadData()) && decided.notice) notifyUnlessDropped(drops, UPDATED_TEXT);
   const changed = status.state !== page.state;
-  page.state = status.state;
-  page.step = status.step ?? null;
-  page.outputs = status.outputs ?? null;
-  page.failedText = status.error ?? null;
+  Object.assign(page, pageState(status));
   renderView();
   renderBanner();
   if (changed && page.data) {
@@ -1256,6 +979,13 @@ function renderData() {
 
 // ---- start ------------------------------------------------------------------------------------
 
+// What the other modules need of this one, before anything can call it: what a request does when the server is gone
+// (shared.js), and the popover, the panel, the player, the changes and the caption on screen for the editor.
+function connect() {
+  onServerGone(serverGone);
+  connectEditor({ closePop, holdAt, playSpan, refreshCaption, sendChange, showInPanel });
+}
+
 function bind() {
   $("approve").addEventListener("click", openConfirm);
   $("confirm-back").addEventListener("click", () => confirmDialog.close());
@@ -1282,6 +1012,7 @@ function bind() {
 }
 
 async function start() {
+  connect();
   bind();
   renderPlay();
   try {

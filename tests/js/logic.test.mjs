@@ -10,10 +10,15 @@ import {
   changedRuns,
   clock,
   DIFF_CELLS,
+  fieldAfterReload,
+  hasUnsavedCaption,
+  keepsOpenEditor,
   leadIn,
   litPieces,
   nearestUnit,
+  pageState,
   placePopover,
+  playerClock,
   pollVersion,
   previewLine,
   reelTime,
@@ -55,6 +60,31 @@ test("sourceTime inverts reelTime", () => {
   assert.equal(sourceTime(3, s), 6); // the end of the reel is the end of the last segment
   assert.equal(sourceTime(99, s), 6);
   for (const r of [0, 0.25, 1.5, 1.999, 2.75]) assert.equal(reelTime(sourceTime(r, s), s), r);
+});
+
+test("playerClock shows the reel's length string once the position is at the end of the reel, where clock would round it another way", () => {
+  // The reel is 12.3496 s long unrounded, so the server writes 0:12.3; its segments and duration_s are rounded to the
+  // millisecond (12.35), and clock of 12.35 is 0:12.4.
+  const segments = [[0, 5], [8, 15.35]];
+  assert.equal(clock(reelTime(15.35, segments)), "0:12.4");
+  assert.equal(playerClock(15.35, segments, 12.35, "0:12.3"), "0:12.3"); // the end of the last segment
+  assert.equal(playerClock(15.35 - SEAM_S / 2, segments, 12.35, "0:12.3"), "0:12.3"); // as the video seeks to it
+  assert.equal(playerClock(20, segments, 12.35, "0:12.3"), "0:12.3"); // past it
+  // inside the reel it is clock of the reel time, as before
+  assert.equal(playerClock(0, segments, 12.35, "0:12.3"), "0:00.0");
+  assert.equal(playerClock(2.5, segments, 12.35, "0:12.3"), "0:02.5");
+  assert.equal(playerClock(9.5, segments, 12.35, "0:12.3"), "0:06.5");
+  assert.equal(playerClock(15, segments, 12.35, "0:12.3"), "0:12.0");
+  // the rounded segments can add up to less than duration_s: 12.348 here, 12.3504 unrounded (the server writes 0:12.4)
+  const short = [[0, 5], [8, 15.348]];
+  assert.equal(clock(reelTime(15.348, short)), "0:12.3");
+  assert.equal(playerClock(15.348, short, 12.35, "0:12.4"), "0:12.4");
+  // or to more than it: a reel time at or past duration_s is the end whatever the source time says
+  const long = [[0, 5], [8, 15.352]];
+  assert.equal(playerClock(15.3505, long, 12.35, "0:12.3"), "0:12.3");
+  // no segment: an empty reel
+  assert.equal(playerClock(0, [], 0, "0:00.0"), "0:00.0");
+  assert.equal(playerClock(3, [], 0, "0:00.0"), "0:00.0");
 });
 
 test("skipTarget jumps over a cut to a hair past the next start, stays inside a segment, ends after the last", () => {
@@ -312,4 +342,73 @@ test("captionToSave: nothing for the saved caption, null for the sentence's own 
   assert.equal(captionToSave(claude, claude, own), undefined); // typed back what is saved: nothing to send
   assert.equal(captionToSave(edited, claude, own), edited); // the caption from before Claude's change is sent
   assert.equal(captionToSave(own, claude, own), null);
+});
+
+test("hasUnsavedCaption: the field holds text that closing the editor without saving would lose", () => {
+  const own = "這招能幫你省很多事";
+  const edited = "這招能幫你省很多時間";
+  // a sentence that shows its own text
+  assert.equal(hasUnsavedCaption(own, own, own), false); // nothing typed
+  assert.equal(hasUnsavedCaption(edited, own, own), true);
+  assert.equal(hasUnsavedCaption("", own, own), true); // an emptied field is a change too (the server says why not)
+  // a sentence with a caption text
+  assert.equal(hasUnsavedCaption(edited, edited, own), false);
+  assert.equal(hasUnsavedCaption(own, edited, own), true); // the sentence's own text again: its caption text goes
+  assert.equal(hasUnsavedCaption("這招省時間", edited, own), true);
+  // the same test as the one that saving makes: a text captionToSave sends nothing for is nothing to lose
+  for (const [text, saved] of [[own, own], [edited, edited], [edited, own], [own, edited], ["", edited]]) {
+    assert.equal(hasUnsavedCaption(text, saved, own), captionToSave(text, saved, own) !== undefined);
+  }
+});
+
+test("fieldAfterReload: an untouched field follows a caption Claude changed, a typed one stays", () => {
+  const before = "這招能幫你省很多事";
+  const claude = "這招幫你省下時間";
+  const typed = "這招能幫你省很多時間";
+  // nothing typed (the field still holds the saved caption of before): it takes the new saved caption
+  assert.equal(fieldAfterReload(before, before, claude), claude);
+  // the user typed something: it stays, whatever the saved caption became
+  assert.equal(fieldAfterReload(typed, before, claude), typed);
+  assert.equal(fieldAfterReload("", before, claude), ""); // an emptied field is typed text too
+  assert.equal(fieldAfterReload(claude, before, claude), claude); // typed what Claude wrote: unchanged either way
+  // the saved caption did not change: nothing moves
+  assert.equal(fieldAfterReload(before, before, before), before);
+  assert.equal(fieldAfterReload(typed, before, before), typed);
+  // once it follows, there is nothing to save: no 儲存 writes the old text back, no dropped notice, no refusal to open
+  const shown = fieldAfterReload(before, before, claude);
+  assert.equal(captionToSave(shown, claude, before), undefined);
+  assert.equal(hasUnsavedCaption(shown, claude, before), false);
+});
+
+test("keepsOpenEditor: the open editor stays when it is of the same sentence, or of another one and holds text that is not saved", () => {
+  const own = "這招能幫你省很多事";
+  const edited = "這招能幫你省很多時間";
+  const open = (text, saved = own) => ({ id: "s02", text, saved, original: own });
+  // nothing open: the editor of any sentence opens
+  assert.equal(keepsOpenEditor(null, "s03"), false);
+  // another sentence's editor holds text to save: it stays, the new one does not open
+  assert.equal(keepsOpenEditor(open(edited), "s03"), true);
+  assert.equal(keepsOpenEditor(open(""), "s03"), true);
+  assert.equal(keepsOpenEditor(open(own, edited), "s03"), true); // the sentence's own text again is a change to save
+  // another sentence's editor holds nothing to save: the new one opens
+  assert.equal(keepsOpenEditor(open(own), "s03"), false);
+  assert.equal(keepsOpenEditor(open(edited, edited), "s03"), false);
+  // the same sentence: the open editor stays whatever its field holds, so that asking for it never drops typed text
+  assert.equal(keepsOpenEditor(open(edited), "s02"), true);
+  assert.equal(keepsOpenEditor(open(""), "s02"), true);
+  assert.equal(keepsOpenEditor(open(own), "s02"), true);
+  assert.equal(keepsOpenEditor(open(edited, edited), "s02"), true);
+});
+
+test("pageState takes the state, step, outputs and error text from the state keys of the server's answer", () => {
+  // the keys GET /api/data carries for the first view are those GET /api/state has, so one reading serves both
+  const working = { state: "working", step: "approve", error: null, outputs: null };
+  assert.deepEqual(pageState(working), { state: "working", step: "approve", outputs: null, failedText: null });
+  const failed = { state: "failed", step: null, error: "輸出失敗了。", outputs: null };
+  assert.deepEqual(pageState(failed), { state: "failed", step: null, outputs: null, failedText: "輸出失敗了。" });
+  const outputs = { final: "out/final.mp4", preview: null, folder: "out" };
+  const done = { state: "done", step: null, error: null, outputs };
+  assert.deepEqual(pageState(done), { state: "done", step: null, outputs, failedText: null });
+  // keys the answer does not have are null, never undefined
+  assert.deepEqual(pageState({ state: "editing" }), { state: "editing", step: null, outputs: null, failedText: null });
 });

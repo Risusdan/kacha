@@ -14,7 +14,8 @@ change the edit they are given) and checked in memory with edit.validate_edit be
 ChangeRefused carries Chinese text for the page: GLYPH_TEXT when the caption font lacks a character a new caption
 text shows (checked first, by caption_lines), INVISIBLE_TEXT when all it lacks are characters that show nothing of
 their own (a zero-width space pasted in), CAPTION_EMPTY_TEXT when a caption text would show nothing,
-NOTHING_LEFT_TEXT when the edit would leave no sentence in the reel, else REFUSED_TEXT. The English reasons go to
+NOTHING_LEFT_TEXT when the edit would leave no sentence in the reel, TOO_SHORT_TEXT when it keeps sentences but every
+piece the cuts leave is too short to render (edit.NO_PIECE_LEFT_ERROR), else REFUSED_TEXT. The English reasons go to
 work/review.log, which is where Claude looks when the page said to ask it. Then write_edit replaces edit.json (a temp
 file of its own in work/, then os.replace, so a reader never sees half a file and two writers never share a temp
 file) and validate_project records the pass in state.json. preview_caption gives the lines a caption text would get,
@@ -23,11 +24,13 @@ refused as its change would be, and writes nothing.
 Removing a sentence adds a cuts.extra range for it (reason review_text.REMOVED_REASON), drops its entry from
 sentences, and cuts the extra speech and the retakes of that sentence that were kept and are still in the reel: they
 were said in front of it and would be left hanging. work/review-undo.json keeps what restoring needs: for each
-sentence removed in the page, the entry it had in sentences and the candidates this changed from kept to cut. The
-record holds the sha256 of transcript.json and trim.json it was made for, because the ids in it mean something else
-once either file changes; a record of other files is ignored (as is one that cannot be read). Restoring takes off the
-cuts.extra range that holds the sentence, all of it, and puts back every spoken sentence of the range, with the saved
-entry where there is one and DEFAULT_SEM and DEFAULT_WEIGHT otherwise (a range Claude wrote has no record).
+sentence removed in the page, the entry it had in sentences and the candidates this changed from kept to cut. A
+remove or a restore writes it, and each write keeps only the sentences the new edit removes: one that is kept again (a
+restore on the page, or Claude put it back in edit.json) has nothing left to restore. The record holds the sha256 of
+transcript.json and trim.json it was made for, because the ids in it mean something else once either file changes; a
+record of other files is ignored (as is one that cannot be read). Restoring takes off the cuts.extra range that holds
+the sentence, all of it, and puts back every spoken sentence of the range, with the saved entry where there is one and
+DEFAULT_SEM and DEFAULT_WEIGHT otherwise (a range Claude wrote has no record).
 """
 
 import copy
@@ -38,7 +41,14 @@ from contextlib import suppress
 from pathlib import Path
 
 from pipeline.captions import break_lines, missing_glyphs, remap_units
-from pipeline.edit import build_segments, kept_sentences, require_valid, validate_edit, validate_project
+from pipeline.edit import (
+    NO_PIECE_LEFT_ERROR,
+    build_segments,
+    kept_sentences,
+    require_valid,
+    validate_edit,
+    validate_project,
+)
 from pipeline.errors import PipelineError
 from pipeline.project import Project, edit_stage, file_sha256, write_text_atomically
 from pipeline.review_data import NotReady, edit_version
@@ -53,11 +63,12 @@ CHANGE_TYPES = ("cut", "remove", "restore", "caption")  # the types of change th
 CUT_WITH_REMOVAL = ("extra", "retake")  # the kinds of candidate that go when the sentence they belong to goes
 CONFLICT_TEXT = "決定剛被更新過，請再看一次。"
 NOTHING_LEFT_TEXT = "至少要留下一句，這個改動沒有存。"
+TOO_SHORT_TEXT = "這樣剪完，留下的每一段都太短，沒辦法輸出，這個改動沒有存。"
 REFUSED_TEXT = "這個改動會讓剪接設定出錯，沒有存。請回對話請 Claude 看看。"
 CAPTION_EMPTY_TEXT = "字幕至少要有一個字，沒有存。"
 GLYPH_TEXT = "字型沒有「{chars}」這幾個字，沒有存。"  # {chars}: the characters the caption font lacks
 INVISIBLE_TEXT = "字幕裡有看不見的字元，多半是貼上時帶進來的，沒有存。把貼上的那一段刪掉重打。"  # all it lacks
-_NOTHING_LEFT = "nothing is left"  # what validate_edit says when the edit leaves no sentence, or no piece, in the reel
+_NOTHING_LEFT = "nothing is left"  # in what validate_edit says when no sentence is left (and no piece: matched first)
 _CAPTION_PATH = "captions.text"  # validate_edit's errors about a caption text start with this
 _NOTHING_SHOWN = (": must not be empty", ": must have a character to show")  # and end so when the text shows nothing
 _LOGGED_CHARS = 100  # text the page sent goes into the log as its repr, cut after this many characters
@@ -148,6 +159,14 @@ def _read_undo(p: Project, hashes: tuple[str, str]) -> dict[str, dict]:
     if not isinstance(removed, dict):
         return {}
     return {sid: entry for sid, entry in removed.items() if _is_entry(entry)}
+
+
+def _still_removed(removed: dict[str, dict], edit: dict, transcript: dict) -> dict[str, dict]:
+    """The entries of `removed` whose sentence `edit` removes: spoken and not kept, so inside a cuts.extra range of
+    it. The entry of a sentence that is kept again, or that is not a spoken sentence of `transcript`, is left out."""
+    kept = set(kept_sentences(edit, transcript))
+    spoken = {sentence["id"] for sentence in transcript["sentences"] if sentence["spoken"]}
+    return {sid: entry for sid, entry in removed.items() if sid in spoken and sid not in kept}
 
 
 def _write_undo(p: Project, hashes: tuple[str, str], removed: dict[str, dict]) -> None:
@@ -279,9 +298,12 @@ def _invisible(char: str) -> bool:
 
 def _refusal(errors: list[str]) -> ChangeRefused:
     """The refusal of an edit that validate_edit finds `errors` in: CAPTION_EMPTY_TEXT when a caption text would
-    show nothing (the user can fix that), NOTHING_LEFT_TEXT when no sentence would be left, else REFUSED_TEXT."""
+    show nothing (the user can fix that), TOO_SHORT_TEXT when sentences are kept but no piece of the reel is long
+    enough (NO_PIECE_LEFT_ERROR), NOTHING_LEFT_TEXT when no sentence would be left, else REFUSED_TEXT."""
     if any(error.startswith(_CAPTION_PATH) and error.endswith(_NOTHING_SHOWN) for error in errors):
         return ChangeRefused(CAPTION_EMPTY_TEXT, reasons=errors)
+    if NO_PIECE_LEFT_ERROR in errors:
+        return ChangeRefused(TOO_SHORT_TEXT, reasons=errors)
     if any(_NOTHING_LEFT in error for error in errors):
         return ChangeRefused(NOTHING_LEFT_TEXT, reasons=errors)
     return ChangeRefused(REFUSED_TEXT, reasons=errors)
@@ -295,9 +317,10 @@ def _is_caption(change: dict) -> bool:
 
 def _build(change: object, edit: dict, transcript: dict, trims: dict,
            removed: dict[str, dict]) -> tuple[dict, dict[str, dict] | None]:
-    """(the new edit for `change`, the removed record to write: None when the change leaves the record alone).
-    A change that is none of the four the page sends raises ChangeRefused; so does a caption text with a character
-    the caption font lacks (caption_lines), before anything else checks it."""
+    """(the new edit for `change`, the removed record to write: None when the change leaves the record alone). The
+    record may still hold sentences the new edit keeps (a restored one among them): apply_change leaves them out
+    (_still_removed). A change that is none of the four the page sends raises ChangeRefused; so does a caption text
+    with a character the caption font lacks (caption_lines), before anything else checks it."""
     if isinstance(change, dict):
         kind = change.get("type")
         if kind == "cut" and isinstance(change.get("trim"), str) and type(change.get("cut")) is bool:
@@ -306,9 +329,7 @@ def _build(change: object, edit: dict, transcript: dict, trims: dict,
             new, entry = remove_sentence(edit, transcript, trims, change["sentence"])
             return new, {**removed, change["sentence"]: entry}
         if kind == "restore" and isinstance(change.get("sentence"), str):
-            new = restore_sentence(edit, transcript, change["sentence"], removed)
-            used = {item["id"] for item in new["sentences"]} - {item["id"] for item in edit["sentences"]}
-            return new, {sid: entry for sid, entry in removed.items() if sid not in used}
+            return restore_sentence(edit, transcript, change["sentence"], removed), removed
         if _is_caption(change):
             if change["text"] is not None:
                 caption_lines(edit, transcript, change["sentence"], change["text"])
@@ -349,7 +370,7 @@ def apply_change(p: Project, version: str, change: dict) -> dict:
     write_edit(p, new)
     validate_project(p)
     if removed is not None:
-        _write_undo(p, hashes, removed)
+        _write_undo(p, hashes, _still_removed(removed, new, transcript))
     return {"version": edit_version(p)}
 
 
