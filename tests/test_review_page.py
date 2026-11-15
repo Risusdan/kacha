@@ -178,6 +178,12 @@ def test_the_page_is_light_and_in_chinese():
     assert "正在輸出…" not in page and "同意，正在輸出" not in page
 
 
+def test_the_top_bar_starts_with_the_name_kacha():
+    index = read("index.html")
+    assert re.search(r'<header class="bar">\s*<span class="brand">Kacha</span>', index)
+    assert re.search(r"(?m)^\.brand\s*\{", read("review.css"))
+
+
 def test_the_page_text_has_no_ids():
     index = read("index.html")
     assert not ID.search(index), ID.findall(index)

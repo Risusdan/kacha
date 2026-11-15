@@ -1,6 +1,6 @@
 [project]
 name = "kacha"
-version = "0.2.0"
+version = "0.2.1"
 description = "Turns talking-head footage into captioned Instagram Reels."
 license = "Apache-2.0"
 license-files = ["LICENSE"]
