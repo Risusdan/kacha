@@ -36,6 +36,7 @@ from pipeline.project import (
     load_state,
     save_state,
 )
+from pipeline.scene_render import still_paths
 from pipeline.script import parse_script
 from pipeline.storyboard import build_storyboard
 from pipeline.style import font_path, load_style
@@ -608,3 +609,32 @@ def _record_rewritten(p: Project, rewritten: dict[str, tuple[str, str]]) -> None
         for name, path in _edit_files(p).items():
             checked[name] = renewed(str(path), checked[name])
     save_state(p, state)
+
+
+# ---- card stills --------------------------------------------------------------------------------------------------
+
+STAND_IN_CARD = (65, 269, 1015, 501)  # x0, y0, x1, y1 (the pixel after the last) of the red of a stand-in still
+
+
+@lru_cache(maxsize=1)
+def stand_in_png() -> bytes:
+    """A transparent 1080x1920 PNG, opaque red over STAND_IN_CARD."""
+    import cv2
+
+    image = np.zeros((1920, 1080, 4), np.uint8)
+    x0, y0, x1, y1 = STAND_IN_CARD
+    image[y0:y1, x0:x1] = (0, 0, 255, 255)  # BGRA
+    ok, data = cv2.imencode(".png", image)
+    assert ok
+    return data.tobytes()
+
+
+def stand_in_render_stills(p, placed, style, run=None):
+    """render_stills without Node: each still that is not there yet is written where the real one goes
+    (scene_render.still_paths) as stand_in_png."""
+    stills = still_paths(p, placed, style)
+    for _, still in stills:
+        if not still.is_file():
+            still.parent.mkdir(parents=True, exist_ok=True)
+            still.write_bytes(stand_in_png())
+    return stills

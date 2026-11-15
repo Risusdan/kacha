@@ -1767,6 +1767,23 @@ def test_render_overlays_the_clip_of_each_scene_at_its_reel_frame(approved_proje
     assert graph.index("overlay=eof_action=pass") < graph.index("subtitles=")
 
 
+def test_render_places_a_card_away_from_the_head_found_while_it_shows(approved_project, monkeypatch, tmp_path,
+                                                                    no_output_check):
+    from pipeline.scenes import scene_layout
+
+    p = with_scene(approved_project)
+    edit, transcript, trims = (json.loads(path.read_text(encoding="utf-8"))
+                               for path in (p.edit_path, p.work / "transcript.json", p.work / "trim.json"))
+    item, = scene_layout(edit, transcript, trims)
+    middle = (item.source_start + item.source_end) / 2
+    head_left = {"t": middle, "x0": 0.0, "y0": 0.2, "x1": 0.4, "y1": 0.65, "score": 0.9}
+    (p.work / "faces.json").write_text(json.dumps({"boxes": [head_left]}), encoding="utf-8")
+    approve_project(p)  # faces.json is an input of the storyboard: its previews place the cards by it too
+    scenes = stand_in_cards(monkeypatch, tmp_path)
+    render(p, runner=fake_encoder([]))
+    assert [placed.align for placed in scenes[0]] == ["right"]
+
+
 def test_render_lists_the_card_sources_as_inputs_when_there_are_scenes(approved_project, monkeypatch, tmp_path,
                                                                         no_output_check):
     from pipeline.scene_render import scenes_dir
@@ -1795,6 +1812,9 @@ def test_changing_a_card_source_makes_the_render_run_again(approved_project, mon
     assert render(p, runner=fake_encoder(calls))["skipped"] is True
     card = copy / "src" / "cards" / "keyword-pop.jsx"
     card.write_text(card.read_text(encoding="utf-8") + "\n// changed\n", encoding="utf-8")
+    with pytest.raises(PipelineError, match="gate1 not approved"):  # the previews were drawn with the old code
+        render(p, runner=fake_encoder(calls))
+    approve_project(p)
     assert render(p, runner=fake_encoder(calls))["skipped"] is False
     assert len(finals_of(calls)) == 2
 

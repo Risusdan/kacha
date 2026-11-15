@@ -13,6 +13,7 @@ import pytest
 from helpers import (
     default_edit,
     edited_project_from_documents,
+    stand_in_render_stills,
     timed_sentence,
     transcript_and_trims,
     validated_storyboard,
@@ -32,7 +33,7 @@ from pipeline.edit import (
 )
 from pipeline.errors import EditInvalid, PipelineError
 from pipeline.project import file_sha256
-from pipeline.review_data import NOT_READY_TEXT, NotReady, edit_version, page_data, sentence_tokens
+from pipeline.review_data import NOT_READY_TEXT, NotReady, edit_version, page_data, scene_stills, sentence_tokens
 from pipeline.review_text import ASR_NOTE, LISTEN_NOTE, LOW_MATCH_NOTE, REMOVED_REASON, trim_label
 from pipeline.storyboard import clock
 from pipeline.style import font_path, load_style
@@ -700,9 +701,46 @@ def test_scenes_are_the_scenes_that_show_with_their_source_times_and_the_label_t
     data = page_data(project_for(tmp_path, transcript, trims, edit))
     units = transcript["sentences"][1]["units"]
     assert data["scenes"] == [{"start": round(units[0]["start"], 3), "end": round(units[-1]["end"], 3),
-                               "label": "動畫：數字卡　兩小時／一天多撐"}]
+                               "label": "動畫：數字卡　兩小時／一天多撐", "still": None}]
 
 
 def test_a_reel_without_scenes_has_none(tmp_path):
     transcript, trims = transcript_and_trims("今天我們來聊剪輯。", [("今天我們來聊剪輯", 0.0, 1.6)])
     assert page_data(project_for(tmp_path, transcript, trims))["scenes"] == []
+
+
+def scene_over_the_first_sentence(tmp_path):
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。", [("今天我們來聊剪輯", 0.0, 1.6)])
+    edit = default_edit(transcript, trims)
+    edit["scenes"] = [{"id": "sc1", "card": "number-slab", "at": {"s": "s01", "char": 0},
+                       "until": {"s": "s01", "end": True}, "params": {"value": "兩小時", "label": "一天多撐"}}]
+    return project_for(tmp_path, transcript, trims, edit)
+
+
+def test_a_scene_has_the_url_of_its_still_once_the_still_is_there(tmp_path):
+    p = scene_over_the_first_sentence(tmp_path)
+    (scene,) = page_data(p)["scenes"]
+    assert scene["still"] is None
+    stills, style = scene_stills(p)
+    (item, still), = stills
+    assert still.parent == p.work / "scenes" and re.fullmatch(r"[0-9a-f]{64}\.png", still.name)
+    stand_in_render_stills(p, [item], style)
+    (scene,) = page_data(p)["scenes"]
+    assert scene["still"] == f"scene-stills/{still.name}"
+    assert scene["label"] == "動畫：數字卡　兩小時／一天多撐"
+
+
+def test_the_still_of_a_scene_is_of_its_card_placed_away_from_the_head_in_faces_json(tmp_path):
+    p = scene_over_the_first_sentence(tmp_path)
+    ((placed, _),), _ = scene_stills(p)
+    assert placed.align == "center"
+    head_left = {"t": 0.8, "x0": 0.0, "y0": 0.2, "x1": 0.4, "y1": 0.65, "score": 0.9}
+    (p.work / "faces.json").write_text(json.dumps({"boxes": [head_left]}), encoding="utf-8")
+    ((placed, _),), _ = scene_stills(p)
+    assert placed.align == "right"
+
+
+def test_a_reel_without_scenes_has_no_stills(tmp_path):
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。", [("今天我們來聊剪輯", 0.0, 1.6)])
+    stills, _ = scene_stills(project_for(tmp_path, transcript, trims))
+    assert stills == []

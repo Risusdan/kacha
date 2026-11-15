@@ -9,9 +9,11 @@ would otherwise overwrite each other's key. Before anything else, a request whos
 a page of another site that reaches the port through a host name of its own (DNS rebinding) gets nothing.
 
 Only the fixed routes answer. The path of a request (the part before "?") is looked up as a whole string, and no
-part of it is ever joined to a file path: the page files are those PAGE_FILES names in PAGE_DIR, the font is the
-style's caption font, and the videos are work/review.mp4 and out/preview.mp4, sent with byte ranges (byte_range),
-which a browser needs to seek in a video. Any other path is 404. The page's script is four ES modules (review.js,
+part of it is ever joined to a file path but the name of a still: the page files are those PAGE_FILES names in PAGE_DIR,
+the font is the style's caption font, and the videos are work/review.mp4 and out/preview.mp4, sent with byte ranges
+(byte_range), which a browser needs to seek in a video. GET /scene-stills/<name>.png sends work/scenes/<name>.png when
+the whole path matches STILL_PATH (<name> is 64 lowercase hex digits, as scene_render names a still). Any other path is
+404. The page's script is four ES modules (review.js,
 which index.html loads, and logic.js, shared.js and editor.js, which it imports by relative URL); a browser asks for
 each of them by the route of its own name, so each is a route in PAGE_FILES.
 
@@ -19,6 +21,12 @@ Reading a request is pipeline.review_requests: the Range header (byte_range), th
 Content-Length (content_length) and the JSON body of each POST route (change_request, caption_request,
 approve_request, reveal_request). What it refuses with BadRequest is a 400 here, and a Range with RangeNotSatisfiable
 a 416; the limits on the size of a body (MAX_BODY, DRAIN_CAP) are applied here, where the body is read.
+
+Before it answers GET /api/data, the server draws the stills of the cards that page_data would give no still for
+(ensure_stills: review_data.scene_stills, then render_stills, one run at a time; a request that comes meanwhile waits
+for it). Stills that cannot be made are a line in work/review.log, and they are not tried again while this server
+runs; their scenes keep a still of null, and the page shows their labels. serve_review draws them before it announces
+the page, so that the first view has them.
 
 GET /api/data is review_data.page_data with the state of the page (the "state", "step", "error" and "outputs" that
 ReviewServer.state gives, from one reading, so that the page's first view needs no poll to show a step or an error);
@@ -69,14 +77,16 @@ connection that sends or reads nothing for REQUEST_TIMEOUT_S ends.
 The server writes only inside the project folder: work/review.log; through apply_change, what it writes
 (edit.json, review-undo.json and, through validate_project and update_state, state.json with its lock file
 work/state.lock); the lock file work/output.lock, which approve() creates (ProjectLock); and through the steps what
-they write. Both lock files are made when missing and never deleted. It deletes nothing of its own (storyboard and
-render delete only what they always have, inside the project).
+they write; and through render_stills the stills under work/scenes, work/stills.log and a folder of its own run,
+work/scenes/still-tmp-<random>. Both lock files are made when missing and never deleted. It deletes nothing of its own
+(storyboard, render and render_stills delete only what they always have, inside the project).
 """
 
 import datetime
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -98,7 +108,7 @@ from pipeline.errors import PipelineError
 from pipeline.project import Project, ProjectBusy, ProjectLock, approve_gate, edit_stage, gate_ok, step_done
 from pipeline.render import render
 from pipeline.review_actions import LOG_FILE, ChangeRefused, VersionConflict, apply_change, preview_caption
-from pipeline.review_data import NotReady, edit_version, page_data
+from pipeline.review_data import NotReady, edit_version, page_data, scene_stills
 from pipeline.review_requests import (
     BadRequest,
     RangeNotSatisfiable,
@@ -111,7 +121,14 @@ from pipeline.review_requests import (
     reveal_request,
 )
 from pipeline.review_video import make_review_video, review_video_path
-from pipeline.storyboard import NOT_VALIDATED_REFUSAL, OLDER_FILES_REFUSAL, build_storyboard
+from pipeline.scene_render import render_stills
+from pipeline.storyboard import (
+    NOT_VALIDATED_REFUSAL,
+    OLDER_FILES_REFUSAL,
+    STILLS_FAILED,
+    build_storyboard,
+    still_failure,
+)
 from pipeline.style import font_path, load_style
 
 REVIEW_IDLE_S = 1800
@@ -145,6 +162,7 @@ PAGE_FILES = {  # route -> (the file in PAGE_DIR, its content type)
     "/review.css": ("review.css", "text/css; charset=utf-8"),
 }
 FONT_ROUTE = "/font/caption.ttf"
+STILL_PATH = re.compile(r"/scene-stills/([0-9a-f]{64})\.png")  # the whole path; the name is a still's
 MEDIA_ROUTES = {  # route -> the video of a project it sends
     "/media/review.mp4": review_video_path,
     "/media/preview.mp4": lambda p: p.out / "preview.mp4",
@@ -278,7 +296,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._file(_caption_font(p), "font/ttf")
         elif path in MEDIA_ROUTES:
             self._file(MEDIA_ROUTES[path](p), "video/mp4", ranges=True)
+        elif (still := STILL_PATH.fullmatch(path)) is not None:
+            self._file(p.work / "scenes" / f"{still.group(1)}.png", "image/png")
         elif path == "/api/data":
+            review.ensure_stills()
             self._json(200, {**page_data(p), **review.state()})
         elif path == "/api/state":
             self._json(200, review.status())
@@ -428,8 +449,12 @@ class ReviewServer:
     waiting, and let go by the job at its end, before it shows as ended."""
 
     def __init__(self, p: Project, *, key: str | None = None, idle_s: float = REVIEW_IDLE_S,
-                 steps: Steps | None = None, reveal: Callable[[Path], None] = reveal_in_folder):
+                 steps: Steps | None = None, reveal: Callable[[Path], None] = reveal_in_folder,
+                 stills: Callable[..., object] | None = None):
         self.p = p
+        self.stills = render_stills if stills is None else stills  # (p, placed, style): draws the missing stills
+        self._stills_lock = threading.Lock()  # one run of the stills at a time
+        self._unmade: set[Path] = set()  # stills that could not be made: not tried again
         self.key = secrets.token_urlsafe(KEY_BYTES) if key is None else key
         self.idle_s = idle_s
         self.steps = Steps() if steps is None else steps
@@ -633,6 +658,37 @@ class ReviewServer:
             self._job_step = None
             self.change_lock.release()
 
+    def ensure_stills(self) -> None:
+        """Draw the stills of the scenes that show that are not in work/scenes yet and were not tried before, in one
+        run. render_stills refuses a whole run for one card it cannot draw, so when a run of several fails, each of
+        them is tried on its own; a still that cannot be made is logged and not tried again. Nothing is drawn while
+        page_data is not ready."""
+        with self._stills_lock:
+            try:
+                stills, style = scene_stills(self.p)
+            except (NotReady, PipelineError):
+                return  # page_data answers for it
+            wanted = [(item, still) for item, still in stills if not still.is_file() and still not in self._unmade]
+            if len(wanted) > 1 and self._draw([item for item, _ in wanted], style) is None:
+                return
+            for item, still in wanted:
+                if still.is_file():
+                    continue
+                failed = self._draw([item], style)
+                if failed is not None:
+                    self.log(f"{STILLS_FAILED}{failed}")
+                    self._unmade.add(still)
+
+    def _draw(self, placed: list, style: dict) -> str | None:
+        """Draw the stills of `placed`; why they could not be drawn, or None when they were."""
+        try:
+            self.stills(self.p, placed, style)
+        except PipelineError as error:
+            return _english(error)
+        except OSError as error:
+            return still_failure(error)
+        return None
+
     def log(self, text: str) -> None:
         """Add `text` to work/review.log, after the time. A log that cannot be written is not reported: it must not
         turn an answer into an error."""
@@ -660,6 +716,7 @@ def serve_review(p: Project, *, open_browser: Callable[[str], object], announce:
     video = make_review_video(p)["video"]
     server = server_factory(p)
     try:
+        server.ensure_stills()
         url = server.start()
         announce({"url": url, "port": server.port, "video": video})
         open_browser(url)

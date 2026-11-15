@@ -1,6 +1,6 @@
 # kacha
 
-這個 repo 把手機直拍的口播影片剪成 Instagram Reels。`pipeline` 指令負責前處理、轉錄、粗剪、字幕和輸出；Claude 當導演，依使用者的意見寫 `edit.json`。第 1 期的成果是一支有字幕的順剪 mp4，放在專案的 `out/final.mp4`。第 2 期進行中：已經有推近（預設不推近，只在使用者指定的地方放大）和三張動畫卡片（重點字、數字卡、清單，用 Remotion 渲染，只加在使用者要的地方），寫法都見 `storyboard` skill。其他的卡、B-roll 還沒有。
+這個 repo 把手機直拍的口播影片剪成 Instagram Reels。`pipeline` 指令負責前處理、轉錄、粗剪、字幕和輸出；Claude 當導演，依使用者的意見寫 `edit.json`。第 1 期的成果是一支有字幕的順剪 mp4，放在專案的 `out/final.mp4`。第 2 期進行中：已經有推近（預設不推近，只在使用者指定的地方放大）和六張動畫卡片（重點字、數字卡、清單、標題卡、長條圖、對比，用 Remotion 渲染，只加在使用者要的地方），寫法都見 `storyboard` skill。其他的卡、B-roll 還沒有。
 
 使用者資料在 `studio/`（不進 git）：`inbox/` 放素材，`brand/` 放偏好，`projects/<日期-代稱>/` 每支影片一個資料夾。`studio/` 的位置由環境變數 `REELS_STUDIO` 決定，沒設就是 repo 底下的 `studio/`。
 
@@ -40,7 +40,7 @@
 - 開了審閱頁之後，使用者回到對話時，先用 `uv run pipeline status <專案>` 看專案走到哪一步，再讀 `edit.json`（他可能在頁面上改過），用句子的內容和時間說，不講代號。
 - 同意綁在使用者看到的那份分鏡稿上，不只是 `edit.json`：分鏡稿用到的任何檔案（`edit.json`、`transcript.json`、`trim.json` 等）之後有改動，都要重跑 `storyboard`（改了 `edit.json` 先跑 `validate`），講給使用者聽，取得同意，再 `approve`；否則 `render` 拒絕執行。`transcribe` 或 `trim` 重跑、讓 `transcript.json` 或 `trim.json` 的內容變了（例如使用者改了腳本之後），也一樣，即使 `edit.json` 沒變。
 - `trim` 重跑之後，候選代號（`t01`、`t02`…）是依位置編的，同一個代號可能指向不同的一段。要從新的 `trim.json` 重新決定 `edit.json` 裡每一個候選（接受或拒絕），不沿用舊的決定。
-- 關卡 2（樣張）和關卡 3（成品）屬於之後的期別，本期不存在，不要自己加。
+- 關卡 2（有聲預覽）和關卡 3（成品）屬於之後的期別，本期不存在，不要自己加。卡片的樣張併在關卡 1 的分鏡稿裡（見 `storyboard` skill）。
 
 ## 長對話
 
@@ -52,4 +52,11 @@
 - 測試：`uv run pytest`。標了 `slow` 的測試會跑真的語音辨識，預設跳過，`uv run pytest -m slow` 才跑。行為的改動先寫會失敗的測試，再寫程式。
 - 遞迴刪除一律經過 `pipeline.safe_delete` 的 `safe_rmtree`，刪除只發生在專案資料夾內。
 - 第三方的程式庫、模型和字型都必須能商業使用。新增或升級套件之後，跑 `uv run python scripts/third_party.py --check`，並更新 `THIRD_PARTY.md`。任何一項不能商業使用，或查不出授權，停下來問使用者，不自己決定。
-- 設計文件：`docs/superpowers/specs/2026-11-11-reels-workflow-design.md`、第 1 期改版 `docs/superpowers/specs/2026-11-12-phase1-revision-design.md`、互動審閱頁 `docs/superpowers/specs/2026-11-12-interactive-review-design.md`、推近 `docs/superpowers/specs/2026-11-15-punch-in-design.md`、動畫地基 `docs/superpowers/specs/2026-11-15-remotion-foundation-design.md`；實測紀錄：`docs/spikes/2026-11-11-phase0-results.md`。
+- 版本號：寫成 `0.<功能>.<修正>`（例如 `0.2.0`），只寫在 `pyproject.toml` 的 `version`；改了它就跑 `uv lock`，讓 `uv.lock` 跟著改。每次合併到 `main` 時決定要不要加：
+  - 有新功能（使用者看得到的新行為）：中間的數字加 1，最後的數字歸零（`0.2.1` → `0.3.0`）。
+  - 只有修正：最後的數字加 1（`0.3.0` → `0.3.1`）。
+  - 只改說明文件（`README.md`、`docs/`、`FEATURE.md`、`THIRD_PARTY.md`）：不加。
+  - `.claude/skills/` 和這份 `CLAUDE.md` 決定 Claude 怎麼剪，算程式，改了照「功能」或「修正」加。
+
+  合併之前，照上面的規則提出新的版本號，和「要不要合併」一起問使用者。加版本號是分支在合併前的最後一個 commit。新功能寫進 `FEATURE.md` 時，標上它的版本。
+- 設計文件：`docs/superpowers/specs/2026-11-11-reels-workflow-design.md`、第 1 期改版 `docs/superpowers/specs/2026-11-12-phase1-revision-design.md`、互動審閱頁 `docs/superpowers/specs/2026-11-12-interactive-review-design.md`、推近 `docs/superpowers/specs/2026-11-15-punch-in-design.md`、動畫地基 `docs/superpowers/specs/2026-11-15-remotion-foundation-design.md`、再三張卡 `docs/superpowers/specs/2026-11-15-three-more-cards-design.md`、卡片的樣張 `docs/superpowers/specs/2026-11-15-card-previews-design.md`、版本號 `docs/superpowers/specs/2026-11-15-versioning-design.md`；實測紀錄：`docs/spikes/2026-11-11-phase0-results.md`。

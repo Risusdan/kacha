@@ -3,7 +3,11 @@ trim.json and probe.json as the storyboard reads them, and faces.json for the pu
 [start, end, scale, ax, ay] (punch.shots: the anchor in 0-1 of the 9:16 picture the review video shows, rounded to 4
 places), which the page shows by scaling the video about the anchor as it plays. scenes holds, for each animation
 card that shows (scenes.scene_layout), its source start and end and the label the player shows over the video while it
-plays ("動畫：數字卡　兩小時／一天多撐"); the page does not change scenes.
+plays ("動畫：數字卡　兩小時／一天多撐"), and still: the address of the still of its card (STILL_ROUTE and the name of
+the file, scene_render.still_paths) once that is in work/scenes, else null. The card is placed as render places it
+(card_place.placed_scenes, from the faces of faces.json and the shots), for the cuts as they are now, so a change on
+the page can move it, and then its still is another file. scene_stills says which stills the edit wants; the server
+draws the missing ones before it answers. The page does not change scenes.
 
 page_data refuses with NotReady while edit.json has not passed validate on the files as they are now (or while
 require_valid refuses it): Claude is changing it, and the page tries again later. The version (edit_version) is a
@@ -41,9 +45,12 @@ cuts is the number of cuts the storyboard counts: the accepted candidates in the
 
 import hashlib
 import json
+from pathlib import Path
 
 from pipeline import punch
-from pipeline.scenes import scene_label, scene_layout
+from pipeline.card_place import placed_scenes
+from pipeline.scene_render import still_paths
+from pipeline.scenes import Placed, scene_label, scene_layout
 from pipeline.captions import build_events, caption_source, caption_top_px
 from pipeline.edit import (
     Segment,
@@ -157,6 +164,36 @@ def sentence_tokens(sentence: dict, trims: list[dict]) -> list[dict]:
     return result + at_end
 
 
+STILL_ROUTE = "scene-stills/"  # the page asks for the still <name>.png at this address, relative to the page
+
+
+def _stills(p: Project, edit: dict, transcript: dict, trims: dict, style: dict, faces: dict, probe: dict,
+            shots: list[punch.Shot]) -> list[tuple[Placed, Path]]:
+    placed = placed_scenes(edit, transcript, trims, style, faces.get("boxes", []), shots,
+                           (probe["display_w"], probe["display_h"]))
+    return still_paths(p, placed, style)
+
+
+def scene_stills(p: Project) -> tuple[list[tuple[Placed, Path]], dict]:
+    """Each scene that shows, placed as page_data places it, with the path of its still under work/scenes, whether it
+    is there or not, and the style. Raises NotReady when page_data does."""
+    if edit_stage(p) is not None:
+        raise NotReady()
+    try:
+        edit, transcript, trims = require_valid(p)
+    except PipelineError as error:
+        raise NotReady() from error
+    probe = load_document(p.work / "probe.json", "prep", ("duration_s", "display_w", "display_h"))
+    faces = load_document(p.work / "faces.json", "prep", ("boxes",))
+    style = load_style(edit["style"])
+    shots = punch.shots(edit, transcript, trims, faces, probe)
+    return _stills(p, edit, transcript, trims, style, faces, probe, shots), style
+
+
+def _still_address(still: Path | None) -> str | None:
+    return f"{STILL_ROUTE}{still.name}" if still is not None and still.is_file() else None
+
+
 def page_data(p: Project) -> dict:
     """The document the review page loads (see the module text). Raises NotReady unless edit.json has passed
     validate on the current files and require_valid accepts it."""
@@ -240,6 +277,8 @@ def page_data(p: Project) -> dict:
             "listen_note": LISTEN_NOTE if hear else None,
         })
 
+    shots = punch.shots(edit, transcript, trims, faces, probe)
+    stills = {item.index: still for item, still in _stills(p, edit, transcript, trims, style, faces, probe, shots)}
     return {
         "project": p.name,
         "version": version,
@@ -250,9 +289,10 @@ def page_data(p: Project) -> dict:
         "duration_clock": clock(total_duration(segments)),
         "segments": [[_seconds(segment.start), _seconds(segment.end)] for segment in segments],
         "shots": [[_seconds(shot.start), _seconds(shot.end), shot.scale, round(shot.ax, 4), round(shot.ay, 4)]
-                  for shot in punch.shots(edit, transcript, trims, faces, probe)],
+                  for shot in shots],
         "scenes": [{"start": _seconds(item.source_start), "end": _seconds(item.source_end),
-                    "label": "動畫：" + "　".join(scene_label(item.scene))}
+                    "label": "動畫：" + "　".join(scene_label(item.scene)),
+                    "still": _still_address(stills.get(item.index))}
                    for item in scene_layout(edit, transcript, trims) if item.gone is None and item.frames > 0],
         "captions": [
             {"start": _seconds(event.start), "end": _seconds(event.end),

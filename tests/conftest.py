@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from helpers import real_hf_home
+from helpers import real_hf_home, stand_in_render_stills
 
 # The real Hugging Face cache, worked out at import time from the real environment, before any
 # fixture points HOME at a fake folder. Without it the tests would download the 4.7 GB ASR model again.
@@ -29,6 +29,15 @@ def point_env_at(monkeypatch, root: Path) -> None:
 def isolated_env(tmp_path, monkeypatch):
     """Keep every test away from the real home folder and the real studio."""
     point_env_at(monkeypatch, tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def stand_in_stills(monkeypatch):
+    """The storyboard and the review server draw stand-in stills of the cards (helpers.stand_in_render_stills), so that
+    no test of them needs Node. The real render_stills is tested on its own: with a stand-in run in test_scene_render,
+    with Node in test_scene_cards."""
+    monkeypatch.setattr("pipeline.storyboard.render_stills", stand_in_render_stills)
+    monkeypatch.setattr("pipeline.review_server.render_stills", stand_in_render_stills)
 
 
 @pytest.fixture(scope="module")

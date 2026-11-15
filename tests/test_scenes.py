@@ -5,6 +5,7 @@ made up."""
 import copy
 import json
 import re
+from pathlib import Path
 
 import pytest
 from helpers import default_edit, timed_sentence
@@ -60,9 +61,9 @@ def errors_of(*items: dict, **cuts) -> list[str]:
 # ---- the cards ------------------------------------------------------------------------------------------------
 
 
-def test_the_three_cards_of_the_design():
-    assert list(CARDS) == ["keyword-pop", "number-slab", "bullet-list"]
-    assert [card.label for card in CARDS.values()] == ["重點字", "數字卡", "清單"]
+def test_the_six_cards():
+    assert list(CARDS) == ["keyword-pop", "number-slab", "bullet-list", "title-card", "bar-chart", "versus-split"]
+    assert [card.label for card in CARDS.values()] == ["重點字", "數字卡", "清單", "標題卡", "長條圖", "對比"]
     assert not any(card.impact for card in CARDS.values())
 
 
@@ -105,8 +106,9 @@ def test_the_only_layout_is_overlay():
 
 
 def test_an_unknown_card_is_refused():
-    assert errors_of(scene(card="bar-chart")) == [
-        "scenes[0].card: 'bar-chart' is not one of keyword-pop, number-slab, bullet-list"
+    assert errors_of(scene(card="step-flow")) == [
+        "scenes[0].card: 'step-flow' is not one of keyword-pop, number-slab, bullet-list, title-card, bar-chart, "
+        "versus-split"
     ]
 
 
@@ -191,6 +193,16 @@ def test_a_card_is_as_wide_as_each_text_at_its_size_with_the_card_padding():
         ("items[1]", pytest.approx(text_px("背景更新", regular, 56) + 56 + 24 + 2 * 56))]
     assert scenes.card_width_px("number-slab", {"value": "2", "label": "一天"}, fonts) == pytest.approx(
         text_px("一天", regular, 56) + 2 * 64)
+
+
+def test_a_card_is_as_high_as_its_lines_with_the_card_padding():
+    """At rest: the padding above and below, each line at its size times its line height, and the gaps between."""
+    assert scenes.card_height_px("keyword-pop", {"text": "省電"}) == pytest.approx(2 * 24 + 80 * 1.25)
+    assert scenes.card_height_px("number-slab", {"value": "2", "label": "一天"}) == pytest.approx(
+        2 * 40 + 128 * 1.15 + 8 + 56 * 1.3)
+    assert scenes.card_height_px("number-slab", {"value": "2"}) == pytest.approx(2 * 40 + 128 * 1.15)
+    assert scenes.card_height_px("bullet-list", {"items": ["亮度", "背景更新", "定位"]}) == pytest.approx(
+        2 * 40 + 3 * 56 * 1.3 + 2 * 20)
 
 
 def test_a_keyword_pop_is_measured_at_its_largest_while_it_pops(monkeypatch):
@@ -415,5 +427,170 @@ def test_scene_texts_are_the_texts_of_the_params_in_order():
     assert scenes.scene_texts(scene(card="bullet-list", params={"items": ["亮度", "定位"]})) == ["亮度", "定位"]
 
 
+def test_the_labels_and_texts_of_the_new_cards():
+    assert scenes.scene_label(scene(card="title-card", params=TITLE)) == ("標題卡", "今天聊／三個省電技巧")
+    assert scenes.scene_label(scene(card="title-card", params={"title": "三個省電技巧"})) == ("標題卡", "三個省電技巧")
+    assert scenes.scene_label(scene(card="versus-split", params={"left": "自動亮度", "right": "手動調整"})) == (
+        "對比", "自動亮度／手動調整")
+    assert scenes.scene_label(scene(card="versus-split", params=VERSUS)) == (
+        "對比", "自動亮度／比較省電／手動調整／比較耗電")
+    # a bar is its label and its value; the glyph check (scene_render) sees both
+    assert scenes.scene_texts(scene(card="bar-chart", params=BARS)) == ["去年 49%", "今年 96%"]
+    assert scenes.scene_label(scene(card="bar-chart", params=BARS)) == ("長條圖", "去年 49%／今年 96%")
+
+
 def test_the_module_names_its_constants():
     assert (scenes.MIN_SCENE_FRAMES, scenes.MAX_IMPACT) == (30, 3)
+
+
+# ---- the three more cards (spec 2026-11-15-three-more-cards-design) ---------------------------------------------
+
+TITLE = {"kicker": "今天聊", "title": "三個省電技巧"}
+BARS = {"bars": [{"label": "去年", "value": "49%"}, {"label": "今年", "value": "96%"}]}
+VERSUS = {"left": "自動亮度", "left_note": "比較省電", "right": "手動調整", "right_note": "比較耗電"}
+
+
+def bars(*values: str) -> dict:
+    return {"bars": [{"label": f"第{k + 1}季", "value": value} for k, value in enumerate(values)]}
+
+
+def test_an_edit_with_one_scene_of_each_new_card_is_valid():
+    assert errors_of(
+        scene("sc1", "title-card", {"s": "s01"}, {"s": "s01", "end": True}, TITLE),
+        scene("sc2", "bar-chart", {"s": "s02"}, {"s": "s02", "end": True}, BARS),
+        scene("sc3", "versus-split", {"s": "s03"}, {"s": "s03", "end": True}, VERSUS),
+    ) == []
+
+
+def test_a_title_card_may_leave_out_its_kicker_and_a_versus_split_its_notes():
+    assert errors_of(scene(card="title-card", params={"title": "三個省電技巧"})) == []
+    assert errors_of(scene(card="versus-split", params={"left": "自動", "right": "手動"})) == []
+    assert errors_of(scene(card="versus-split", params={"left": "自動", "right": "手動", "right_note": "耗電"})) == []
+
+
+@pytest.mark.parametrize("bad, error", [
+    ({"kicker": "今天聊"}, "scenes[0].params.title: missing"),
+    ({"title": "一二三四五六七八九十"}, "scenes[0].params.title: must be 1 to 9 characters wide, got 10"),
+    ({"title": "標題", "kicker": "一二三四五六七八九十一二三四五"},
+     "scenes[0].params.kicker: must be 0 to 14 characters wide, got 15"),
+    ({"title": "標題", "subtitle": "x"}, "scenes[0].params.subtitle: unknown key"),
+])
+def test_the_params_of_a_title_card(bad, error):
+    assert errors_of(scene(card="title-card", params=bad)) == [error]
+
+
+@pytest.mark.parametrize("bad, error", [
+    ({"left": "自動"}, "scenes[0].params.right: missing"),
+    ({"left": "一二三四五六", "right": "手動"}, "scenes[0].params.left: must be 1 to 5 characters wide, got 6"),
+    ({"left": "自動", "right": "手動", "left_note": "一二三四五六七八九"},
+     "scenes[0].params.left_note: must be 0 to 8 characters wide, got 9"),
+    ({"left": "自動", "right": "手動", "right_note": "一二三四五六七八九"},
+     "scenes[0].params.right_note: must be 0 to 8 characters wide, got 9"),
+])
+def test_the_params_of_a_versus_split(bad, error):
+    assert errors_of(scene(card="versus-split", params=bad)) == [error]
+
+
+NOT_A_NUMBER = "must start with a number (0-9, a comma between groups of three, a point before decimals), got"
+
+
+@pytest.mark.parametrize("bad, error", [
+    ({}, "scenes[0].params.bars: missing"),
+    ({"bars": "49%"}, "scenes[0].params.bars: must be an array of 2 to 4 bars, got a string"),
+    (bars("49%"), "scenes[0].params.bars: must have 2 to 4 bars, got 1"),
+    (bars("1", "2", "3", "4", "5"), "scenes[0].params.bars: must have 2 to 4 bars, got 5"),
+    ({"bars": ["去年", {"label": "今年", "value": "96%"}]}, "scenes[0].params.bars[0]: must be an object, got a string"),
+    ({"bars": [{"label": "去年"}, {"label": "今年", "value": "96%"}]}, "scenes[0].params.bars[0].value: missing"),
+    ({"bars": [{"label": "去年", "value": "49%"}, {"value": "96%"}]}, "scenes[0].params.bars[1].label: missing"),
+    ({"bars": [{"label": "去年", "value": "49%", "color": "red"}, {"label": "今年", "value": "96%"}]},
+     "scenes[0].params.bars[0].color: unknown key"),
+    ({"bars": [{"label": "一二三四五六七", "value": "49%"}, {"label": "今年", "value": "96%"}]},
+     "scenes[0].params.bars[0].label: must be 1 to 6 characters wide, got 7"),
+    ({"bars": [{"label": "去年", "value": 49}, {"label": "今年", "value": "96%"}]},
+     "scenes[0].params.bars[0].value: must be a string, got a number"),
+    (bars("兩小時", "3 小時"), f"scenes[0].params.bars[0].value: {NOT_A_NUMBER} '兩小時'"),
+    (bars("3 小時", "2,5 倍"), f"scenes[0].params.bars[1].value: {NOT_A_NUMBER} '2,5 倍'"),
+    (bars("一二三四五六七八九", "3"), "scenes[0].params.bars[0].value: must be 1 to 8 characters wide, got 9"),
+    (bars("0", "0 %"), "scenes[0].params.bars: at least one value must be more than 0"),
+    ({**BARS, "unit": "%"}, "scenes[0].params.unit: unknown key"),
+])
+def test_the_params_of_a_bar_chart(bad, error):
+    assert errors_of(scene(card="bar-chart", params=bad)) == [error]
+
+
+def test_a_bar_of_zero_beside_others_is_valid():
+    assert errors_of(scene(card="bar-chart", params=bars("0", "12 次"))) == []
+
+
+# the examples scenes/src/number.js is tested with too (tests/js/number.test.mjs), so that both read a value alike
+BAR_NUMBERS = json.loads((Path(__file__).parent / "js" / "bar_numbers.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("value, number", BAR_NUMBERS)
+def test_the_number_a_bar_value_starts_with(value, number):
+    assert scenes.bar_number(value) == number
+
+
+@pytest.mark.parametrize("card, params, path", [
+    ("title-card", {"title": "MMMMMMMMMMMMMMMMMM"}, "scenes[0].params.title"),
+    ("bar-chart", {"bars": [{"label": "A", "value": "8MMMMMMMMMMMMMMM"}, {"label": "B", "value": "1"}]},
+     "scenes[0].params.bars[0].value"),
+    ("versus-split", {"left": "MMMMMMMMMM", "right": "1"}, "scenes[0].params.left"),
+])
+def test_a_text_of_a_new_card_wider_than_the_animation_zone_is_refused(card, params, path):
+    errors = errors_of(scene(card=card, params=params))
+    assert len(errors) == 1, errors
+    match = WIDE.fullmatch(errors[0])
+    assert match and match["path"] == path and int(match["px"]) > 950, errors
+
+
+def test_chinese_texts_at_the_width_limits_of_the_new_cards_fit_the_zone():
+    assert errors_of(scene(card="title-card", params={"kicker": "省電" * 7, "title": "省電省電省電省電省"})) == []
+    assert errors_of(scene(card="bar-chart", params={"bars": [{"label": "省電省電省電", "value": "1 省電省電省電省"},
+                                                              {"label": "省電", "value": "2"}]})) == []
+    assert errors_of(scene(card="versus-split", params={"left": "省電省電省", "right": "省電省電省",
+                                                        "left_note": "省電省電省電省電",
+                                                        "right_note": "省電省電省電省電"})) == []
+
+
+def test_the_new_cards_are_as_wide_as_each_text_at_its_size_with_what_goes_beside_it():
+    fonts = default_fonts()
+    regular, bold = fonts["regular"], fonts["bold"]
+    assert scenes.card_texts_px("title-card", TITLE, fonts) == [
+        ("kicker", pytest.approx(text_px("今天聊", regular, 44) + 2 * 56)),
+        ("title", pytest.approx(text_px("三個省電技巧", bold, 88) + 2 * 56))]
+    assert scenes.card_texts_px("bar-chart", BARS, fonts) == [
+        ("bars[0].label", pytest.approx(text_px("去年", regular, 44) + 2 * 56)),
+        ("bars[0].value", pytest.approx(text_px("49%", bold, 44) + 420 + 16 + 2 * 56)),
+        ("bars[1].label", pytest.approx(text_px("今年", regular, 44) + 2 * 56)),
+        ("bars[1].value", pytest.approx(text_px("96%", bold, 44) + 420 + 16 + 2 * 56))]
+    beside = 2 * 48 + 2 * 32 + 88  # both paddings, the gaps on either side of the VS badge, and the badge
+    assert scenes.card_texts_px("versus-split", VERSUS, fonts) == [
+        ("left", pytest.approx(2 * text_px("自動亮度", bold, 64) + beside)),
+        ("left_note", pytest.approx(2 * text_px("比較省電", regular, 40) + beside)),
+        ("right", pytest.approx(2 * text_px("手動調整", bold, 64) + beside)),
+        ("right_note", pytest.approx(2 * text_px("比較耗電", regular, 40) + beside))]
+
+
+def test_the_new_cards_are_as_high_as_their_lines_with_the_card_padding():
+    assert scenes.card_height_px("title-card", TITLE) == pytest.approx(2 * 40 + 44 * 1.3 + 8 + 88 * 1.2 + 12 + 12)
+    assert scenes.card_height_px("title-card", {"title": "標題"}) == pytest.approx(2 * 40 + 88 * 1.2 + 12 + 12)
+    row = 44 * 1.3 + 8 + max(36, 44 * 1.3)  # the label, its gap, then the bar beside its value
+    assert scenes.card_height_px("bar-chart", BARS) == pytest.approx(2 * 40 + 2 * row + 20)
+    assert scenes.card_height_px("bar-chart", bars("1", "2", "3", "4")) == pytest.approx(2 * 40 + 4 * row + 3 * 20)
+    side, note = 64 * 1.2, 8 + 40 * 1.3
+    assert scenes.card_height_px("versus-split", VERSUS) == pytest.approx(2 * 40 + side + note)
+    assert scenes.card_height_px("versus-split", {"left": "自動", "right": "手動", "left_note": ""}) == pytest.approx(
+        2 * 40 + 88)  # an empty note is no line; the badge is higher than one line
+    assert scenes.card_height_px("versus-split", {"left": "自動", "right": "手動", "right_note": "耗電"}) == \
+        pytest.approx(2 * 40 + side + note)
+
+
+@pytest.mark.parametrize("card, spaces, none", [
+    ("title-card", {"kicker": " \u3000", "title": "標題"}, {"title": "標題"}),
+    ("versus-split", {"left": "自動", "right": "手動", "left_note": "\u00a0 "}, {"left": "自動", "right": "手動"}),
+    ("number-slab", {"value": "2", "label": "  "}, {"value": "2"}),
+])
+def test_an_optional_text_of_spaces_only_is_no_line(card, spaces, none):
+    """The card draws the text without the spaces at its ends, so a text of spaces only is not drawn at all."""
+    assert scenes.card_height_px(card, spaces) == pytest.approx(scenes.card_height_px(card, none))

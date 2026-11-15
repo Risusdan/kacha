@@ -4,8 +4,10 @@ by a stand-in that records the command and writes what render.mjs would, but in 
 texts are made up."""
 
 import json
+import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -16,13 +18,20 @@ from pipeline.errors import PipelineError
 from pipeline.project import Project
 from pipeline.scene_render import (
     NODE_MISSING,
+    RENDER_TIMEOUT_S,
+    STILL_FRAME,
+    STILL_FRAMES,
+    STILLS_TIMEOUT_S,
     cache_key,
     doctor_items,
     node_version,
     render_scenes,
+    render_stills,
     setup_scenes,
     source_files,
     sources_digest,
+    still_key,
+    still_paths,
     style_digest,
 )
 from pipeline.scenes import Placed
@@ -85,17 +94,18 @@ def tools(monkeypatch):
 
 
 def test_the_cache_key_changes_with_each_input_and_only_with_them():
-    base = ("keyword-pop", {"text": "省電", "x": 1}, 45, "style-a", "sources-a")
+    base = ("keyword-pop", {"text": "省電", "x": 1}, 45, "center", "style-a", "sources-a")
     key = cache_key(*base)
-    assert cache_key("keyword-pop", {"x": 1, "text": "省電"}, 45, "style-a", "sources-a") == key  # key order
+    assert cache_key("keyword-pop", {"x": 1, "text": "省電"}, 45, "center", "style-a", "sources-a") == key  # key order
     changed = [
         cache_key("number-slab", *base[1:]),
         cache_key(base[0], {"text": "亮度", "x": 1}, *base[2:]),
         cache_key(*base[:2], 46, *base[3:]),
-        cache_key(*base[:3], "style-b", base[4]),
-        cache_key(*base[:4], "sources-b"),
+        cache_key(*base[:3], "left", *base[4:]),
+        cache_key(*base[:4], "style-b", base[5]),
+        cache_key(*base[:5], "sources-b"),
     ]
-    assert len({key, *changed}) == 6
+    assert len({key, *changed}) == 7
 
 
 def write(path: Path, text: str) -> None:
@@ -188,7 +198,7 @@ def test_the_command_and_the_jobs_render_mjs_gets(project, tools):
     assert runner.jobs["style"] == {**style["scenes"], "fonts": {"regular": style["fonts"]["regular"],
                                                                   "bold": style["fonts"]["bold"]}}
     (job,) = runner.jobs["jobs"]
-    assert (job["card"], job["params"], job["frames"]) == ("keyword-pop", {"text": "省電"}, 45)
+    assert (job["card"], job["params"], job["frames"], job["align"]) == ("keyword-pop", {"text": "省電"}, 45, "center")
     assert job["out"].startswith(str(project.work / "scenes")) and job["out"].endswith(".mov")
 
 
@@ -209,6 +219,13 @@ def test_scenes_of_one_card_params_and_length_are_rendered_once(project, tools):
     assert clips[0][1] == clips[1][1]
 
 
+def test_a_card_placed_to_one_side_is_a_clip_of_its_own_and_render_mjs_is_told_the_side(project, tools):
+    runner = Runner()
+    clips = render_scenes(project, [placed(0), placed(1)._replace(align="left")], load_style(), run=runner)
+    assert [job["align"] for job in runner.jobs["jobs"]] == ["center", "left"]
+    assert clips[0][1] != clips[1][1]
+
+
 def test_only_the_scenes_not_in_the_cache_are_rendered(project, tools):
     style = load_style()
     render_scenes(project, [placed(0)], style, run=Runner())
@@ -226,6 +243,150 @@ def test_a_changed_style_or_card_source_renders_the_clip_again(project, tools, m
     runner = Runner()
     render_scenes(project, [placed(0)], style, run=runner)
     assert len(runner.jobs["jobs"]) == 1
+
+
+# ---- the stills ----------------------------------------------------------------------------------------------
+
+
+def test_a_still_is_frame_81_of_a_card_90_frames_long():
+    """Every card is at rest then: the last frame before its 8-frame exit (scenes/src/timing.js)."""
+    assert (STILL_FRAMES, STILL_FRAME) == (90, 81)
+
+
+def test_the_still_key_has_no_reel_length_and_changes_with_each_other_input():
+    base = ("keyword-pop", {"text": "省電", "x": 1}, "center", "style-a", "sources-a")
+    key = still_key(*base)
+    assert still_key("keyword-pop", {"x": 1, "text": "省電"}, "center", "style-a", "sources-a") == key
+    changed = [
+        still_key("number-slab", *base[1:]),
+        still_key(base[0], {"text": "亮度", "x": 1}, *base[2:]),
+        still_key(*base[:2], "left", *base[3:]),
+        still_key(*base[:3], "style-b", base[4]),
+        still_key(*base[:4], "sources-b"),
+    ]
+    assert len({key, *changed}) == 6
+    assert key not in {cache_key(base[0], base[1], frames, "center", "style-a", "sources-a")
+                       for frames in (STILL_FRAMES, 45)}
+
+
+def test_an_edit_without_scenes_renders_no_still_and_makes_no_folder(project, monkeypatch):
+    monkeypatch.setattr(scene_render, "node_bin", refuse)
+    assert render_stills(project, [], load_style(), run=refuse) == []
+    assert not (project.work / "scenes").exists()
+
+
+def test_the_stills_are_rendered_by_one_node_run_then_come_from_the_cache_whatever_the_length(project, tools):
+    style = load_style()
+    scenes = [placed(0, frames=45), placed(1, "number-slab", {"value": "兩小時", "label": "一天多撐"}, 60)]
+    runner = Runner()
+    stills = render_stills(project, scenes, style, run=runner)
+    assert len(runner.calls) == 1
+    assert [scene for scene, _ in stills] == scenes
+    for _, still in stills:
+        assert still.parent == project.work / "scenes" and still.suffix == ".png" and still.is_file()
+    longer = [scene._replace(frames=scene.frames + 30) for scene in scenes]
+    assert [path for _, path in render_stills(project, longer, style, run=refuse)] == [path for _, path in stills]
+
+
+def test_the_still_jobs_render_mjs_gets_and_the_folder_it_runs_in(project, tools):
+    style = load_style()
+    runner = Runner()
+    render_stills(project, [placed(0, frames=45)._replace(align="right")], style, run=runner)
+    (command, kwargs), = runner.calls
+    assert runner.tmpdir.parent == project.work / "scenes" and runner.tmpdir.name.startswith("still-tmp-")
+    assert command == ["/stand-in/node", str(scene_render.scenes_dir() / "render.mjs"), str(runner.tmpdir / "jobs.json")]
+    assert kwargs["cwd"] == scene_render.scenes_dir()
+    assert runner.jobs["style_dir"] == str(style["dir"])
+    (job,) = runner.jobs["jobs"]
+    assert {key: job[key] for key in ("kind", "card", "params", "frames", "frame", "align")} == {
+        "kind": "still", "card": "keyword-pop", "params": {"text": "省電"}, "frames": 90, "frame": 81, "align": "right"}
+    assert Path(job["out"]).parent == project.work / "scenes" and job["out"].endswith(".png")
+    assert not runner.tmpdir.exists()
+    assert not (project.work / "scenes" / "jobs.json").exists()
+
+
+def test_only_the_missing_stills_are_rendered_and_each_side_is_a_still_of_its_own(project, tools):
+    style = load_style()
+    render_stills(project, [placed(0)], style, run=Runner())
+    runner = Runner()
+    stills = render_stills(project, [placed(0), placed(1)._replace(align="left")], style, run=runner)
+    assert [job["align"] for job in runner.jobs["jobs"]] == ["left"]
+    assert stills[0][1] != stills[1][1]
+
+
+def test_a_left_over_still_folder_older_than_an_hour_is_removed_and_a_recent_one_kept(project, tools):
+    folder = project.work / "scenes"
+    old, recent, clips = folder / "still-tmp-old", folder / "still-tmp-recent", folder / "tmp"
+    for each in (old, recent, clips):
+        (each / "inner").mkdir(parents=True)
+    hour_ago = time.time() - 3700
+    for each in (old, clips):
+        os.utime(each, (hour_ago, hour_ago))
+    render_stills(project, [placed(0)], load_style(), run=Runner())
+    assert not old.exists()
+    assert recent.is_dir() and clips.is_dir()  # another run's, and render's own
+
+
+def test_a_left_over_still_folder_another_run_removes_first_is_no_error(project, tools, monkeypatch):
+    """Two runs that start together both find an interrupted run's folder; the one that comes second finds it gone."""
+    folder = project.work / "scenes"
+    old = folder / "still-tmp-old"
+    (old / "inner").mkdir(parents=True)
+    hour_ago = time.time() - 3700
+    os.utime(old, (hour_ago, hour_ago))
+    real = scene_render.safe_rmtree
+
+    def removed_first(path, **kwargs):
+        if Path(path) == old:
+            real(path, **kwargs)  # the other run
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(scene_render, "safe_rmtree", removed_first)
+    (_, still), = render_stills(project, [placed(0)], load_style(), run=Runner())
+    assert still.is_file() and not old.exists()
+
+
+def test_a_still_run_has_a_timeout_of_its_own_much_shorter_than_a_render(project, tools):
+    """A still run answers a page that waits for it: a hung run must not hold it for the hour a render may take."""
+    runner = Runner()
+    render_stills(project, [placed(0)], load_style(), run=runner)
+    (_, kwargs), = runner.calls
+    assert kwargs["timeout"] == STILLS_TIMEOUT_S == 120
+    runner = Runner()
+    render_scenes(project, [placed(1)], load_style(), run=runner)
+    assert [kwargs["timeout"] for command, kwargs in runner.calls if str(command[1]).endswith("render.mjs")] == [
+        RENDER_TIMEOUT_S]
+
+
+def test_a_failed_still_render_says_why_keeps_a_log_removes_its_folder_and_caches_nothing(project, tools):
+    runner = Runner(fail="Error: no composition named keyword-pop")
+    with pytest.raises(PipelineError) as failed:
+        render_stills(project, [placed(0)], load_style(), run=runner)
+    assert failed.value.message == "the card previews failed to render: Error: no composition named keyword-pop"
+    log = Path(failed.value.extra["log"])
+    assert log == project.work / "stills.log" and "a stack trace" in log.read_text(encoding="utf-8")
+    assert not list((project.work / "scenes").glob("*.png"))
+    assert not runner.tmpdir.exists()
+
+
+def test_a_still_render_mjs_did_not_write_is_an_error(project, tools):
+    def silent(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, "", "")
+    with pytest.raises(PipelineError) as failed:
+        render_stills(project, [placed(0)], load_style(), run=silent)
+    assert failed.value.message.startswith("the card previews failed to render: ")
+    assert failed.value.message.endswith(".png was not written")
+
+
+def test_a_still_refuses_what_a_clip_refuses_before_node_runs(project, tools, monkeypatch):
+    with pytest.raises(PipelineError) as failed:
+        render_stills(project, [placed(0, params={"text": "省電😀"})], load_style(), run=refuse)
+    assert "has no glyph for" in failed.value.message
+    monkeypatch.setattr(scene_render, "node_bin", lambda: None)
+    with pytest.raises(PipelineError) as failed:
+        render_stills(project, [placed(0)], load_style(), run=refuse)
+    assert failed.value.message == NODE_MISSING
 
 
 NODE_CRASH = (
@@ -453,3 +614,39 @@ def test_a_real_render_through_the_cache(project):
     assert probe.stdout.strip() == "40"
     assert not (project.work / "scenes" / "tmp").exists()
     assert render_scenes(project, [placed(0, frames=40)], style, run=refuse) == clips
+
+
+def test_a_real_run_of_render_mjs_writes_no_bundle_cache(project):
+    """Runs that bundle at the same time (the review page drawing stills while a storyboard or render runs, or two
+    projects at once) would share one bundle cache under scenes/node_modules/.cache, and the bundler aborts a run when
+    another one writes that cache at the same moment; so render.mjs bundles without a cache, and a run leaves it as it
+    was."""
+    from test_scene_cards import requirements_or_skip  # skips without node, the modules, the browser or the fonts
+
+    requirements_or_skip()
+    cache = scene_render.scenes_dir() / "node_modules" / ".cache"
+
+    def files() -> dict[Path, int]:
+        return {f: f.stat().st_mtime_ns for f in cache.rglob("*") if f.is_file()} if cache.exists() else {}
+
+    before = files()
+    (_, still), = render_stills(project, [placed(0)], load_style())
+    assert still.is_file()
+    assert files() == before
+
+
+def test_a_real_still_is_written_in_the_runs_own_folder_first(project):
+    """Two runs may draw the same still at once (the review page and a storyboard, say). Each writes the still in its
+    own still-tmp- folder and renames it into work/scenes when it is complete, so neither renames, overwrites or
+    removes a file the other is writing: here, a file next to the still under the name of a part file stands for one."""
+    from test_scene_cards import requirements_or_skip  # skips without node, the modules, the browser or the fonts
+
+    requirements_or_skip()
+    style = load_style()
+    (_, still), = still_paths(project, [placed(0)], style)
+    other = still.with_name(f"{still.stem}.part.png")
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"another run's part file")
+    render_stills(project, [placed(0)], style)
+    assert other.read_bytes() == b"another run's part file"
+    assert still.read_bytes().startswith(b"\x89PNG")

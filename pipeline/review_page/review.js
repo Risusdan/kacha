@@ -437,13 +437,37 @@ function showTime() {
   showSentence(t);
 }
 
-// The label of the animation card that plays at source time `t` (sceneAt), over the top of the video; the page shows
-// where a card is and what it says, not the card itself.
+// The animation card that plays at source time `t` (sceneAt), over the video: the still of the card (the card at rest
+// where the reel puts it, as big as the player and not zoomed with the punch-in, under the captions) when the server
+// has one, else its label over the top. The still's address is set only when it changes, so the image loads once; the
+// image shows only once that still has loaded (until then it would show the one before), and a still that does not
+// load gives its scene the label instead.
+let shownStill = null; // the still the image holds, or is loading
+let loadedStill = null; // the still the image has finished loading
+const brokenStills = new Set(); // stills that did not load
+const stillImage = $("scene-still");
+stillImage.addEventListener("load", () => {
+  loadedStill = shownStill;
+  showScene(video.currentTime);
+});
+stillImage.addEventListener("error", () => {
+  if (shownStill !== null) brokenStills.add(shownStill);
+  showScene(video.currentTime);
+});
 function showScene(t) {
   const scene = sceneAt(t, page.data.scenes);
+  const wanted = scene?.still ?? null;
+  const still = wanted !== null && !brokenStills.has(wanted) ? wanted : null;
+  if (still !== null && still !== shownStill) {
+    shownStill = still;
+    loadedStill = null;
+    stillImage.src = still;
+  }
+  stillImage.alt = scene ? scene.label : "";
+  stillImage.hidden = still === null || loadedStill !== still;
   const label = $("scene");
-  label.textContent = scene ? scene.label : "";
-  label.hidden = !scene;
+  label.textContent = scene && still === null ? scene.label : "";
+  label.hidden = !scene || still !== null;
 }
 
 // The caption on screen at reel time `r`, in word mode with the spoken pieces in the highlight colour; over the

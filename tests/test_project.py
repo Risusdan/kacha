@@ -33,12 +33,14 @@ from pipeline.project import (
     load_project,
     load_state,
     next_step,
+    project_status,
     run_step,
     save_state,
     step_done,
     update_state,
 )
 from pipeline.safe_delete import safe_rmtree
+from pipeline.version import kacha_version
 
 
 def _cli(capsys, *argv):
@@ -906,7 +908,7 @@ def test_approve_records_the_gate(project):
     project.edit_path.write_text("{}")
     run_step(project, "storyboard", {"edit": project.edit_path}, [], lambda: {})
     record = approve_gate(project, "gate1")
-    assert set(record) == {"approved_at", "storyboard_inputs"}
+    assert set(record) == {"approved_at", "storyboard_inputs", "kacha_version"}
     assert load_state(project)["gates"]["gate1"] == record
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", record["approved_at"])
 
@@ -1237,7 +1239,7 @@ def test_cli_new_reports_errors_as_json(inbox_files, capsys):
 
 
 def test_cli_status_without_projects(capsys, studio):
-    assert _cli(capsys, "status") == (0, {"ok": True, "projects": []})
+    assert _cli(capsys, "status") == (0, {"ok": True, "version": kacha_version(), "projects": []})
 
 
 def test_cli_status_lists_every_project_with_its_next_step(inbox_files, capsys):
@@ -1332,7 +1334,7 @@ def test_cli_approve(project, capsys):
     code, out = _cli(capsys, "approve", project.name, "gate1")
     assert code == 0 and out["ok"] is True
     assert out["project"] == project.name and out["gate"] == "gate1"
-    assert set(out) == {"ok", "project", "gate", "approved_at", "storyboard_inputs"}
+    assert set(out) == {"ok", "project", "gate", "approved_at", "kacha_version", "storyboard_inputs"}
     assert gate_ok(project, "gate1")
 
 
@@ -1544,3 +1546,69 @@ def test_a_phase1_project_goes_back_to_transcribe(edited_project, capsys):
     assert code == 1 and out["error"] == "transcript.json was made by an older pipeline: run transcribe again"
     code, out = _cli(capsys, "render", p.name)
     assert code == 1 and "transcribe is out of date" in out["error"]
+
+
+# ---- the version each step and approval was made with (spec 2026-11-15-versioning-design, section 5) ----------
+
+
+def _approved(project):
+    """prep, transcribe, trim and the storyboard done, and gate1 approved."""
+    _finish_early_steps(project)
+    project.edit_path.write_text("{}")
+    run_step(project, "storyboard", {"edit": project.edit_path}, [], lambda: {})
+    approve_gate(project, "gate1")
+
+
+def test_run_step_records_the_kacha_version(project):
+    run_step(project, "prep", {}, [], lambda: {})
+    assert load_state(project)["steps"]["prep"]["kacha_version"] == kacha_version()
+
+
+def test_a_skipped_step_keeps_the_version_that_made_it(project, monkeypatch):
+    monkeypatch.setattr(project_module, "kacha_version", lambda: "0.0.1")
+    run_step(project, "prep", {}, [], lambda: {})
+    monkeypatch.setattr(project_module, "kacha_version", lambda: "0.9.0")
+    assert run_step(project, "prep", {}, [], lambda: {}) == {"skipped": True}
+    assert load_state(project)["steps"]["prep"]["kacha_version"] == "0.0.1"
+
+
+def test_approve_records_the_kacha_version(project):
+    _approved(project)
+    assert load_state(project)["gates"]["gate1"]["kacha_version"] == kacha_version()
+
+
+def test_status_lists_the_version_of_each_done_step_and_the_approval(project):
+    _approved(project)
+    status = project_status(project)
+    assert status["made_with"] == {name: kacha_version() for name in [*status["steps"], "gate1"]}
+
+
+def test_status_leaves_out_an_approval_that_no_longer_counts(project):
+    """The approval was for a storyboard made from files that have changed since (gate1_ok is false): it is not the
+    approval of this project as it stands, so made_with does not name a version for it."""
+    _approved(project)
+    project.edit_path.write_text('{"changed": true}')
+    status = project_status(project)
+    assert status["gate1_ok"] is False
+    assert "gate1" not in status["made_with"]
+
+
+def test_a_project_made_before_versioning_reports_null_and_stays_done(project):
+    _approved(project)
+    before = project_status(project)
+    state = load_state(project)
+    for record in [*state["steps"].values(), *state["gates"].values()]:
+        del record["kacha_version"]
+    save_state(project, state)
+    after = project_status(project)
+    assert (after["next"], after["steps"], after["gate1_ok"]) == (before["next"], before["steps"], before["gate1_ok"])
+    assert after["made_with"] == {name: None for name in [*after["steps"], "gate1"]}
+
+
+def test_another_version_does_not_undo_a_step_or_the_approval(project, monkeypatch):
+    monkeypatch.setattr(project_module, "kacha_version", lambda: "0.0.1")
+    _approved(project)
+    before = project_status(project)
+    monkeypatch.setattr(project_module, "kacha_version", lambda: "0.9.0")
+    after = project_status(project)
+    assert (after["next"], after["steps"], after["gate1_ok"]) == (before["next"], before["steps"], True)

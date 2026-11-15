@@ -33,6 +33,7 @@ from stat import S_ISREG
 from pipeline.errors import PipelineError
 from pipeline.paths import projects_root
 from pipeline.safe_delete import safe_rmtree
+from pipeline.version import kacha_version
 
 STATE_VERSION = 1
 # The version of what each of these steps makes: for transcribe and trim the format of the file it writes
@@ -469,7 +470,9 @@ def run_step(
     are the recorded ones is not read again; its recorded sha256 stands. A step that is skipped writes the
     current size and mtime_ns of its inputs into its record where they are missing or differ, so that the
     next run or status does not read those files again. A step in FORMAT_VERSIONS records its version too,
-    and a record of another version (or of none) is not skipped.
+    and a record of another version (or of none) is not skipped. The record also holds kacha_version, the
+    version of kacha that ran the step; it is only a record: a skipped step keeps the one that made it, and
+    another version never stops a step from being skipped.
 
     The step record is dropped before `fn` runs and written again only when it returns, so a
     step that failed half way is never reported as done. Each of these writes goes through update_state; the
@@ -502,6 +505,7 @@ def run_step(
     result = fn()
     done = {
         "done_at": _now(),
+        "kacha_version": kacha_version(),
         **({"version": FORMAT_VERSIONS[step]} if step in FORMAT_VERSIONS else {}),
         "inputs": current,
         "outputs": recorded_outputs,
@@ -635,8 +639,9 @@ def approve_gate(p: Project, gate: str) -> dict:
 
     The record holds the hash of every input of the storyboard step, edit.json among them
     (storyboard_inputs): the user approved the storyboard as it was shown, which also depends on
-    transcript.json, trim.json and the rest, not only on edit.json. The checks run on state.json as loaded
-    first, without the state lock; only the record is written through update_state."""
+    transcript.json, trim.json and the rest, not only on edit.json. It also holds kacha_version, the version
+    of kacha that recorded the approval, as a record only. The checks run on state.json as loaded first,
+    without the state lock; only the record is written through update_state."""
     if gate not in GATES:
         raise PipelineError(f"unknown gate {gate!r}, expected one of {', '.join(GATES)}")
     state = load_state(p)
@@ -648,6 +653,7 @@ def approve_gate(p: Project, gate: str) -> dict:
         raise PipelineError("run storyboard first")
     record = {
         "approved_at": _now(),
+        "kacha_version": kacha_version(),
         "storyboard_inputs": _storyboard_input_hashes(state),
     }
     update_state(p, lambda fresh: fresh["gates"].__setitem__(gate, record))
@@ -700,12 +706,20 @@ def next_step(p: Project) -> str:
 
 
 def project_status(p: Project) -> dict:
-    """What the status command reports for one project. Hashes each input file once."""
+    """What the status command reports for one project. Hashes each input file once. made_with maps each done
+    step, and gate1 while its approval still counts (gate1_ok), to the version of kacha that made it
+    (kacha_version in its record), or None for a record made before versions were recorded."""
     state = load_state(p)
     cache: HashCache = {}
+    steps = _done_steps(p, state, cache)
+    gate1_ok = _gate_ok(p, state, "gate1", cache)
+    made_with = {step: state["steps"][step].get("kacha_version") for step in steps}
+    if gate1_ok:
+        made_with["gate1"] = state["gates"]["gate1"].get("kacha_version")
     return {
         "name": p.name,
         "next": _next_step(p, state, cache),
-        "steps": _done_steps(p, state, cache),
-        "gate1_ok": _gate_ok(p, state, "gate1", cache),
+        "steps": steps,
+        "gate1_ok": gate1_ok,
+        "made_with": made_with,
     }

@@ -20,6 +20,7 @@ from pipeline.errors import PipelineError
 from pipeline.media import ffmpeg_bin
 from pipeline.paths import repo_root, studio_root
 from pipeline.style import font_path, load_style
+from pipeline.version import kacha_version
 
 # Noto Sans TC variable font, SIL Open Font License 1.1 (google/fonts, ofl/notosanstc).
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanstc/NotoSansTC%5Bwght%5D.ttf"
@@ -248,6 +249,7 @@ def doctor() -> dict:
                 remotion["node"] is not None, remotion["remotion"], remotion["remotion_browser"]]
     return {
         "ok": all(required),
+        "version": kacha_version(),
         "ffmpeg": ffmpeg,
         "libass": libass,
         "h264_videotoolbox": h264,

@@ -12,22 +12,22 @@ const TICK = SIZE.tick; // the size of the circle, in pixels; the tick path is d
 const TICK_PATH = "M 15 29 L 24 38 L 41 19";
 const TICK_LENGTH = 40; // a little over the path's length (38.2), so a dash of this length hides it whole
 
-export function BulletList({ frames, params, style }) {
+export function BulletList({ frames, params, style, align = "center" }) {
   const frame = useCurrentFrame();
   const entered = enterProgress(frame, frames);
   const leave = exitProgress(frame, frames);
   const starts = stagger(params.items.length, frames);
   return (
-    <Zone style={style}>
+    <Zone style={style} align={align}>
       <div
         style={{
           opacity: Math.min(1, 2 * entered) * (1 - leave),
           backgroundColor: style.colors.card,
           borderRadius: style.radius_px,
-          padding: `40px ${SIZE.padding_x}px`,
+          padding: `${SIZE.padding_y}px ${SIZE.padding_x}px`,
           display: "flex",
           flexDirection: "column",
-          gap: 20,
+          gap: SIZE.item_gap,
         }}
       >
         {params.items.map((item, index) => {
@@ -60,12 +60,12 @@ export function BulletList({ frames, params, style }) {
                 style={{
                   fontWeight: WEIGHTS[SIZE.items.weight],
                   fontSize: SIZE.items.size,
-                  lineHeight: 1.3,
+                  lineHeight: SIZE.items.line_height,
                   color: style.colors.text,
                   whiteSpace: "nowrap",
                 }}
               >
-                {item}
+                {item.trim()}
               </div>
             </div>
           );

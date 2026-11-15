@@ -44,9 +44,11 @@ description: 把一支口播影片剪成有字幕的 Reels，帶著整個流程�
 
 輸出的程式改版時（例如聲音處理改了），已經輸出過的專案 `next` 會回到 `render`，直接執行 `render` 也不會跳過。分鏡稿沒變，`gate1_ok` 仍是 `true`，不用重新同意，也不用再 `approve`：告訴使用者成品要用新版的程式重新輸出，然後照第 9 節看可用空間、跑 `render`。
 
+版本號：`status` 和 `doctor` 的結果都有 `version`，是現在這份 kacha 的版本號（例如 `0.2.0`；`uv run pipeline --version` 也印得出來）。`status <專案>` 另有 `made_with`：已完成的每一步和仍然有效的同意（`gate1`，`gate1_ok` 是 `true` 時才列），各是用哪一版做的；`null` 表示是開始記版本號之前做的。這只是紀錄：版本不同不代表要重跑，要不要重跑照舊看 `next`。使用者要回報問題，或問這支是哪一版做的，就用這兩個欄位回答：說現在的版本，和這支每一步是哪一版做的，步驟用中文說（`prep` 前處理、`transcribe` 轉錄、`trim` 粗剪、`storyboard` 分鏡稿、`gate1` 同意、`render` 輸出、`review_video` 審閱用影片、`preview` 手機預覽版），例如「前處理到粗剪是開始記版本號之前做的，分鏡稿和同意是 0.2.0」。不貼欄位名稱。他要在 GitHub 開 Issue 回報時，請他把現在的版本寫進去。
+
 第一次使用，或指令說缺字型、缺模型、缺字典時：`uv run pipeline doctor` 列出缺什麼。任何一項不通過，`ok` 就是 `false`，結束碼是 1。這時輸出裡沒有 `error`，要看下面各個欄位和 `warnings`。
 
-- 缺字幕字型、臉部偵測模型或斷詞字典（`fonts`、`yunet` 或 `caption_dictionary` 是 `false`）：先告訴使用者，再跑 `uv run pipeline setup`。`setup` 下載這三樣，也補齊做動畫卡片的工具（見下一項）；它的結果有 `fonts`、`yunet`、`dictionary`（字典檔的路徑）、`remotion` 和 `remotion_browser`。斷詞是把一句話切成一個個詞：字幕斷行只在詞和詞之間或標點後面，靠斷詞字典找詞的邊界。缺字典時，`storyboard` 和 `render` 會拒絕（`trim` 有時也會），訊息叫你跑 `setup`。臉部偵測模型是 `prep` 偵測臉用的，結果給畫面推近當錨點；字幕不看臉。
+- 缺字幕字型、臉部偵測模型或斷詞字典（`fonts`、`yunet` 或 `caption_dictionary` 是 `false`）：先告訴使用者，再跑 `uv run pipeline setup`。`setup` 下載這三樣，也補齊做動畫卡片的工具（見下一項）；它的結果有 `fonts`、`yunet`、`dictionary`（字典檔的路徑）、`remotion` 和 `remotion_browser`。斷詞是把一句話切成一個個詞：字幕斷行只在詞和詞之間或標點後面，靠斷詞字典找詞的邊界。缺字典時，`storyboard` 和 `render` 會拒絕（`trim` 有時也會），訊息叫你跑 `setup`。臉部偵測模型是 `prep` 偵測臉用的，結果給畫面推近當錨點，也讓動畫卡片避開講者的頭；字幕不看臉。
 - 做動畫卡片的工具不齊（`node` 是 `null`，或 `remotion`、`remotion_browser` 是 `false`）：`render` 用 Remotion（做動畫的程式庫）把卡片渲染成影片，要這三項。`node` 是 Node.js（執行 Remotion 的環境）的路徑，要 Node.js 18.18 以上，找不到或太舊就是 `null`，`warnings` 會說原因；`remotion` 是 `scenes/node_modules` 裝的 Remotion 是不是鎖定的版本；`remotion_browser` 是 Remotion 渲染用的瀏覽器下載了沒有。沒有動畫的專案用不到它們，但 `doctor` 都檢查，缺一項 `ok` 就是 `false`。
   - `node` 是 `null`：你不能補，告訴使用者裝 Node.js 18.18 以上，然後停下來。Remotion 或瀏覽器也缺的話，`setup` 下載完字型、模型和字典之後，會回 `node (Node.js 18.18 or later) not found: install it, then run uv run pipeline setup`（太舊時說版本太舊）；兩樣都在的話，`setup` 照樣成功，`doctor` 的 `node` 仍是 `null`。他裝好之後，跑 `setup`，再跑一次 `doctor`。
   - `remotion` 或 `remotion_browser` 是 `false`：先告訴使用者，再跑 `uv run pipeline setup`。它跑 `npm ci` 照 `scenes/package-lock.json` 裝 Remotion（不跑套件的安裝腳本），再下載瀏覽器（約 459 MB），各自只在缺的時候做。
@@ -72,7 +74,7 @@ uv run pipeline new <影片> <腳本> --slug <英文代稱>
 uv run pipeline prep <專案>
 ```
 
-抽出音訊，也偵測臉的位置（記下來給畫面推近當錨點；字幕固定在畫面下方置中，不看臉）。結果有 `warnings`、`is_hdr`、`is_vfr`、`duration_s`。
+抽出音訊，也偵測臉的位置（記下來給畫面推近當錨點，也讓動畫卡片避開講者的頭；字幕固定在畫面下方置中，不看臉）。結果有 `warnings`、`is_hdr`、`is_vfr`、`duration_s`。
 
 - `aspect W:H will be center-cropped to 9:16`：告訴使用者畫面不是 9:16，會置中裁切成 9:16。
 - `is_hdr` 為 `true`：素材是 HDR（高動態範圍）影片。前處理會多一道轉成 SDR（標準動態範圍）的步驟，比較久，先跟使用者說一聲。
@@ -128,7 +130,7 @@ uv run pipeline validate <專案>
 uv run pipeline storyboard <專案>
 ```
 
-產生 `review/gate1/index.html`（關卡的靜態網頁，下面簡稱「網頁」）和 `review/gate1/storyboard.md`（同樣的內容，方便你引用）。兩個檔案最上面都是摘要、警告和兩個清單（「要你決定」「其他要聽的地方」），下面是句子表和候選表。網頁是單一檔案，縮圖和試聽片段都嵌在裡面，手機也能開，寬度 640 px 以下時每一列變成一張卡片，不用左右滑。輸入都沒變時 `storyboard` 會跳過（`"skipped": true`），要重做加 `--force`。`storyboard` 只在 `edit.json` 通過 `validate`、而且那之後 `edit.json`、`transcript.json`、`trim.json` 都沒再變的時候才做；不然它什麼都不產生，結束碼 1，照第 6 節的說明，跑 `validate` 或重新核對。它還有兩個拒絕，處理方式不同：
+產生 `review/gate1/index.html`（關卡的靜態網頁，下面簡稱「網頁」）和 `review/gate1/storyboard.md`（同樣的內容，方便你引用）。兩個檔案最上面都是摘要、警告和兩個清單（「要你決定」「其他要聽的地方」），下面是句子表和候選表。有動畫時，網頁在兩個清單之後多一節「動畫的樣子」，每段動畫一張卡片的樣張（`storyboard.md` 沒有）。網頁是單一檔案，縮圖、試聽片段和樣張都嵌在裡面，手機也能開，寬度 640 px 以下時每一列變成一張卡片，不用左右滑。輸入都沒變時 `storyboard` 會跳過（`"skipped": true`），要重做加 `--force`。`storyboard` 只在 `edit.json` 通過 `validate`、而且那之後 `edit.json`、`transcript.json`、`trim.json` 都沒再變的時候才做；不然它什麼都不產生，結束碼 1，照第 6 節的說明，跑 `validate` 或重新核對。它還有兩個拒絕，處理方式不同：
 
 - `probe.json not found: run prep first`：前處理的結果不見了。先跑 `prep`，再照 `next` 往下。
 - `sentence bounds in trim.json are out of order: run trim again`：辨識出來的字的時間重疊得很厲害，句子的切點排不出先後。照訊息重跑 `trim` 沒有用：`trim` 的結果只由輸入決定，輸入沒變，結果就一樣。`pipeline` 目前沒有處理這個狀況的辦法（記在 `docs/backlog/2026-11-12-phase1-review-items.md` 的 D2：碰到這個拒絕，就是該修它的時候）。把 `error` 轉述給使用者，不改 `trim.json`，等他決定。
@@ -168,7 +170,7 @@ uv run pipeline storyboard <專案>
 
 ### 在電腦前：審閱頁
 
-審閱頁是 `pipeline review` 啟動的互動網頁，只在這台電腦上用（它只接受這台電腦本身 `127.0.0.1` 的連線）。左邊的影片照剪完的樣子播：播的是審閱用影片 `work/review.mp4`（從原始影片轉出、整支沒剪過的低畫質影片），播到剪掉的地方就跳到下一段留下的地方，字幕疊在上面。右邊是整支的逐字稿，剪掉的、要你決定的、字幕可能有錯字的地方都有標記，點了浮出小卡，上面是你的註記（沒有註記的，頁面依種類產生說明）。使用者在頁面上可以：
+審閱頁是 `pipeline review` 啟動的互動網頁，只在這台電腦上用（它只接受這台電腦本身 `127.0.0.1` 的連線）。左邊的影片照剪完的樣子播：播的是審閱用影片 `work/review.mp4`（從原始影片轉出、整支沒剪過的低畫質影片），播到剪掉的地方就跳到下一段留下的地方，字幕疊在上面，動畫卡片停住時的樣子也是。右邊是整支的逐字稿，剪掉的、要你決定的、字幕可能有錯字的地方都有標記，點了浮出小卡，上面是你的註記（沒有註記的，頁面依種類產生說明）。使用者在頁面上可以：
 
 - 把程式找到的一段切換成剪掉或保留（不能自己選任意一段字剪掉）；
 - 拿掉一句，或復原拿掉的句子（復原用的紀錄在 `work/review-undo.json`）；
@@ -223,7 +225,7 @@ uv run pipeline review <專案>
 
 ### 不在電腦前：寫訊息
 
-訊息裡要寫出網頁的位置（`review/gate1/index.html`，用瀏覽器開）：每一項的播放鍵和「其他要聽的地方」都在網頁上。使用者用 Remote Control、不在電腦前時，他打不開路徑，所以傳完這則訊息之後，用 SendUserFile 把 `index.html` 傳給他（縮圖和試聽片段都嵌在裡面，只傳這一個檔案）。使用者要改、你重做分鏡稿之後，網頁的內容變了，Remote Control 下，傳完新的訊息之後再傳一次新的 `index.html`。預覽版 `preview.mp4` 要等第 9 節的 `render` 做完才有，不在這一步傳。
+訊息裡要寫出網頁的位置（`review/gate1/index.html`，用瀏覽器開）：每一項的播放鍵和「其他要聽的地方」都在網頁上。使用者用 Remote Control、不在電腦前時，他打不開路徑，所以傳完這則訊息之後，用 SendUserFile 把 `index.html` 傳給他（縮圖、試聽片段和樣張都嵌在裡面，只傳這一個檔案）。使用者要改、你重做分鏡稿之後，網頁的內容變了，Remote Control 下，傳完新的訊息之後再傳一次新的 `index.html`。預覽版 `preview.mp4` 要等第 9 節的 `render` 做完才有，不在這一步傳。
 
 訊息依序寫這幾件事：
 
@@ -236,6 +238,7 @@ uv run pipeline review <專案>
    | `few pauses: quiet-point detection unreliable` | 停頓很少，切點是否在靜音裡的判斷不可靠 |
    | `long word split across caption lines` | 有詞太長，字幕從詞的中間斷開（一個英文詞或網址比一行還寬，只好斷在字元之間；那一句在網頁上標「有詞太長，從中間斷開」） |
    | 以 `scenes[` 開頭的 | 一段動畫出不來，或剪完不到 1 秒：照 `storyboard.md` 警告裡的中文說是哪張卡、上面寫什麼，問他要移到哪裡或拿掉 |
+   | 以 `card previews not made:` 開頭的 | 動畫卡片的樣張做不出來，網頁上沒有「動畫的樣子」，這次看不到卡片的樣子；把冒號後面的原因轉述。原因多半也會讓 `render` 失敗，先處理：做卡片的工具不齊，照第 1 節；卡片字型畫不出某個字，照 `storyboard` skill 的「scenes：動畫」改卡片上的字 |
    | `preview over 30 MiB: not kept` | 手機預覽版超過 30 MiB（對話傳檔的上限），沒有留；成品照樣完成（這則出現在第 9 節 `render` 的結果裡） |
    | 以 `preview failed:` 開頭的 | 手機預覽版做不出來，把冒號後面的原因轉述；成品照樣完成（同上，出現在 `render` 的結果裡） |
 
@@ -313,7 +316,7 @@ uv run pipeline review <專案>
 
 ### 動畫
 
-預設沒有動畫。使用者要某個地方放動畫卡片（或改卡片上的字、不要這段動畫了）時，照 `storyboard` skill 的「scenes：動畫」改 `edit.json`，接著和其他改動一樣 `validate`、`storyboard`（審閱頁開著時 `validate` 就好），告訴他卡片上寫什麼、實際從幾秒到幾秒，再問一次同意。本期有三張卡：重點字、數字卡、清單。動畫列在分鏡稿句子表的「動畫」欄和摘要的「動畫」；審閱頁播到那段時，在影片上方標出卡片的名稱和文字，不播真的動畫。關卡 1 的訊息不用另外講動畫，也不要自己建議加動畫。審閱頁不能改動畫，要改就在對話裡說。
+預設沒有動畫。使用者要某個地方放動畫卡片（或改卡片上的字、不要這段動畫了）時，照 `storyboard` skill 的「scenes：動畫」改 `edit.json`，接著和其他改動一樣 `validate`、`storyboard`（審閱頁開著時 `validate` 就好），告訴他卡片上寫什麼、實際從幾秒到幾秒，再問一次同意。本期有六張卡：重點字、數字卡、清單、標題卡、長條圖、對比。動畫列在分鏡稿句子表的「動畫」欄和摘要的「動畫」，網頁的「動畫的樣子」有每段動畫一張卡片停住時的樣張；審閱頁播到那段時，卡片停住時的樣子疊在影片上（畫不出來時改標卡片的名稱和文字），不播進場和退場的動作。關卡 1 的訊息不用另外講動畫，也不要自己建議加動畫。審閱頁不能改動畫，要改就在對話裡說。
 
 ### 做完之後
 

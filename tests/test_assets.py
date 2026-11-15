@@ -14,6 +14,7 @@ from pipeline.assets import doctor, fetch, hf_model_present, setup_fonts
 from pipeline.cli import main, registered_commands
 from pipeline.errors import PipelineError
 from pipeline.style import load_style
+from pipeline.version import kacha_version
 
 
 def test_fetch_rejects_bad_checksum(tmp_path):
@@ -313,6 +314,10 @@ def test_doctor_missing_aligner_makes_ok_false(tmp_path, monkeypatch):
     assert {k: v for k, v in report.items() if k not in ("ok", "asr_models")} == {
         k: v for k, v in baseline.items() if k not in ("ok", "asr_models")
     }
+
+
+def test_doctor_reports_the_version():
+    assert doctor()["version"] == kacha_version()
 
 
 def test_doctor_without_ffmpeg_reports_instead_of_raising(tmp_path, monkeypatch):

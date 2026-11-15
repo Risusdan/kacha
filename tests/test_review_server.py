@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from helpers import edited_project_from_script
+from helpers import edited_project_from_script, stand_in_png, stand_in_render_stills
 
 from pipeline import review_server
 from pipeline.assets import MIN_FREE_GB
@@ -1413,6 +1413,157 @@ def test_the_idle_decision_is_taken_under_the_entry_lock_and_closes_the_server_f
     assert stopped == ["idle"]
     assert_json(answers[0], 403, {"error": DENIED_TEXT})
     assert fake.calls == []
+
+
+# ---- the stills of the cards ----------------------------------------------------------------------------------
+
+
+def with_a_scene(p: Project) -> Project:
+    """`p` with a keyword-pop scene over its first kept sentence, validated again."""
+    edit = load_edit(p.edit_path)
+    first = edit["sentences"][0]["id"]
+    edit["scenes"] = [{"id": "sc1", "card": "keyword-pop", "params": {"text": "省電"},
+                       "at": {"s": first, "char": 0}, "until": {"s": first, "end": True}}]
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    validate_project(p)
+    return p
+
+
+def counting_stills(calls: list, pause_s: float = 0.0):
+    """A stand-in for render_stills that notes how many stills it is asked for, waits `pause_s`, and draws them."""
+    def stills(p, placed, style, run=None):
+        calls.append(len(placed))
+        time.sleep(pause_s)
+        return stand_in_render_stills(p, placed, style)
+    return stills
+
+
+def test_data_draws_the_missing_stills_first_and_then_finds_them(validated, serve):
+    p = with_a_scene(validated)
+    calls: list[int] = []
+    server = serve(p, key=KEY, stills=counting_stills(calls))
+    (scene,) = ask(server, "GET", "/api/data").json()["scenes"]
+    assert calls == [1] and scene["still"].startswith("scene-stills/")
+    assert ask(server, "GET", "/api/data").json()["scenes"] == [scene]
+    assert calls == [1]
+    answer = ask(server, "GET", "/" + scene["still"])
+    assert answer.status == 200 and answer.headers["Content-Type"] == "image/png" and answer.body == stand_in_png()
+    assert ask(server, "GET", "/" + scene["still"], cookie=None).status == 403
+
+
+def test_two_requests_at_once_draw_the_stills_once(validated, serve):
+    p = with_a_scene(validated)
+    calls: list[int] = []
+    server = serve(p, key=KEY, stills=counting_stills(calls, pause_s=0.5))
+    answers: list[Answer] = []
+    threads = [threading.Thread(target=lambda: answers.append(ask(server, "GET", "/api/data"))) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert calls == [1]
+    assert [answer.json()["scenes"][0]["still"] is not None for answer in answers] == [True, True]
+
+
+def test_stills_that_cannot_be_made_are_logged_once_and_not_tried_again(validated, serve):
+    p = with_a_scene(validated)
+    calls: list[int] = []
+
+    def failing(p, placed, style, run=None):
+        calls.append(len(placed))
+        raise PipelineError("node not found: install Node.js 18.18 or later")
+
+    server = serve(p, key=KEY, stills=failing)
+    for _ in range(2):
+        answer = ask(server, "GET", "/api/data")
+        assert answer.status == 200
+        (scene,) = answer.json()["scenes"]
+        assert scene["still"] is None and scene["label"] == "動畫：重點字　省電"
+    assert calls == [1]
+    assert log_text(p).count("card previews not made: node not found: install Node.js 18.18 or later") == 1
+
+
+def test_only_a_still_name_of_64_lowercase_hex_digits_is_served(validated, serve):
+    p = with_a_scene(validated)
+    server = serve(p, key=KEY, stills=counting_stills([]))
+    (scene,) = ask(server, "GET", "/api/data").json()["scenes"]
+    name = scene["still"].removeprefix("scene-stills/").removesuffix(".png")
+    (p.work / "scenes" / f"{name}.mov").write_bytes(b"a clip")
+    (p.work / "scenes" / f"{name.upper()}.png").write_bytes(b"not ours")
+    for path in (f"/scene-stills/{name}.mov", f"/scene-stills/{name.upper()}.png", f"/scene-stills/{name[:-1]}.png",
+                 f"/scene-stills/{name}0.png", f"/scene-stills/{name}.png/", f"/scene-stills/x{name}.png",
+                 f"/scene-stills/../scenes/{name}.png", f"/scene-stills/%2e%2e/{name}.png", "/scene-stills/",
+                 f"/scene-stills/{'0' * 64}.png"):
+        assert_json(ask(server, "GET", path), 404, {"error": SERVER_ERROR_TEXT}, path)
+    assert ask(server, "GET", f"/scene-stills/{name}.png").status == 200
+
+
+def with_two_scenes(p: Project, first: str, last: str) -> Project:
+    """`p` with a keyword-pop scene over its first kept sentence and one over its last, validated again."""
+    edit = load_edit(p.edit_path)
+    ids = [sentence["id"] for sentence in edit["sentences"]]
+    edit["scenes"] = [{"id": f"sc{n}", "card": "keyword-pop", "params": {"text": text},
+                       "at": {"s": sid, "char": 0}, "until": {"s": sid, "end": True}}
+                      for n, (sid, text) in enumerate(((ids[0], first), (ids[-1], last)), 1)]
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    validate_project(p)
+    return p
+
+
+NO_GLYPH = "the card font NotoSansTC-Bold.ttf has no glyph for: \U0001F600 (U+1F600)"
+
+
+def test_a_still_that_cannot_be_made_does_not_keep_the_others_of_its_run_from_being_drawn(validated, serve):
+    """render_stills refuses a whole run for one card it cannot draw: each still is then tried on its own, once."""
+    p = with_two_scenes(validated, "省電", "亮度\U0001F600")
+    calls: list[list[str]] = []
+
+    def stills(p, placed, style, run=None):
+        texts = [item.scene["params"]["text"] for item in placed]
+        calls.append(texts)
+        if any("\U0001F600" in text for text in texts):
+            raise PipelineError(NO_GLYPH)
+        return stand_in_render_stills(p, placed, style)
+
+    server = serve(p, key=KEY, stills=stills)
+    first, last = ask(server, "GET", "/api/data").json()["scenes"]
+    assert first["still"] is not None and last["still"] is None
+    assert ask(server, "GET", "/api/data").json()["scenes"] == [first, last]
+    assert calls == [["省電", "亮度\U0001F600"], ["省電"], ["亮度\U0001F600"]]
+    assert log_text(p).count(f"card previews not made: {NO_GLYPH}") == 1
+
+
+def test_an_os_error_while_drawing_the_stills_is_logged_and_the_data_answered(validated, serve):
+    p = with_a_scene(validated)
+
+    def failing(p, placed, style, run=None):
+        raise OSError(28, "No space left on device")
+
+    server = serve(p, key=KEY, stills=failing)
+    answer = ask(server, "GET", "/api/data")
+    assert answer.status == 200 and answer.json()["scenes"][0]["still"] is None
+    assert "card previews not made: [Errno 28] No space left on device" in log_text(p)
+
+
+def test_serve_review_draws_the_stills_before_it_announces(validated):
+    p = with_a_scene(validated)
+    events: list[tuple] = []
+    servers: list[ReviewServer] = []
+
+    def stills(p, placed, style, run=None):
+        events.append(("stills", len(placed)))
+        return stand_in_render_stills(p, placed, style)
+
+    def factory(project: Project) -> ReviewServer:
+        servers.append(ReviewServer(project, key=KEY, stills=stills))
+        return servers[-1]
+
+    def open_browser(url: str) -> None:
+        threading.Thread(target=servers[0].stop).start()
+
+    serve_review(p, open_browser=open_browser, announce=lambda info: events.append(("announce", info["url"])),
+                 server_factory=factory)
+    assert events == [("stills", 1), ("announce", servers[0].url)]
 
 
 # ---- serve_review -----------------------------------------------------------------------------

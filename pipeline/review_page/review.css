@@ -93,6 +93,8 @@ button.pill { cursor: pointer; }
                padding: 4px 10px; border-radius: 999px; background: rgba(29, 29, 31, 0.78); color: #fff;
                font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 .scene-label[hidden] { display: none; }
+.scene-still { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.scene-still[hidden] { display: none; }
 .controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--sub); }
 .clock { font-variant-numeric: tabular-nums; }
 

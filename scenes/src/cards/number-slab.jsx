@@ -11,7 +11,7 @@ const SIZE = SIZES["number-slab"];
 
 const easeOut = Easing.out(Easing.cubic);
 
-export function NumberSlab({ frames, params, style }) {
+export function NumberSlab({ frames, params, style, align = "center" }) {
   const frame = useCurrentFrame();
   const { enter } = inOut(frames);
   const entered = enterProgress(frame, frames);
@@ -19,13 +19,13 @@ export function NumberSlab({ frames, params, style }) {
   const leave = exitProgress(frame, frames);
   const rise = interpolate(easeOut(entered), [0, 1], [100, 0]);
   return (
-    <Zone style={style}>
+    <Zone style={style} align={align}>
       <div
         style={{
           opacity: Math.min(1, 2 * entered) * (1 - leave),
           backgroundColor: style.colors.card,
           borderRadius: style.radius_px,
-          padding: `40px ${SIZE.padding_x}px`,
+          padding: `${SIZE.padding_y}px ${SIZE.padding_x}px`,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
@@ -37,28 +37,28 @@ export function NumberSlab({ frames, params, style }) {
               transform: `translateY(${rise}%)`,
               fontWeight: WEIGHTS[SIZE.value.weight],
               fontSize: SIZE.value.size,
-              lineHeight: 1.15,
+              lineHeight: SIZE.value.line_height,
               color: style.colors.text,
               whiteSpace: "nowrap",
               backgroundImage: `linear-gradient(transparent 55%, ${style.colors.accent} 55%, ${style.colors.accent} 92%, transparent 92%)`,
             }}
           >
-            {params.value}
+            {params.value.trim()}
           </div>
         </div>
-        {params.label ? (
+        {params.label?.trim() ? (
           <div
             style={{
               opacity: labelIn,
-              marginTop: 8,
+              marginTop: SIZE.label_gap,
               fontWeight: WEIGHTS[SIZE.label.weight],
               fontSize: SIZE.label.size,
-              lineHeight: 1.3,
+              lineHeight: SIZE.label.line_height,
               color: style.colors.muted,
               whiteSpace: "nowrap",
             }}
           >
-            {params.label}
+            {params.label.trim()}
           </div>
         ) : null}
       </div>

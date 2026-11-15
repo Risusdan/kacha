@@ -1,25 +1,36 @@
 """Rendering the animation cards of an edit, and the Remotion items of setup and doctor
 (docs/superpowers/specs/2026-11-15-remotion-foundation-design.md, section 7).
 
-Each scene that shows (scenes.scene_spans) becomes a clip of its card, its params and its length in frames, which
-scenes/render.mjs renders to transparent ProRes 4444. A clip is kept as work/scenes/<key>.mov, the key being a
-sha256 of the card, the params, the frames, style_digest (style.json and the two fonts) and sources_digest
+Each scene that shows (scenes.scene_spans) becomes a clip of its card, its params, its length in frames and where
+the card goes on the zone (its align, pipeline.card_place), which scenes/render.mjs renders to transparent ProRes
+4444. A clip is kept as work/scenes/<key>.mov, the key being a sha256 of the card, the params, the frames, the
+align, style_digest (style.json and the two fonts) and sources_digest
 (scenes/src, render.mjs and package-lock.json): a clip whose file is there is not rendered again. The clips that are
 missing are rendered by one run of render.mjs (one bundle, one browser), with TMPDIR at work/scenes/tmp, which is
 removed afterwards, as Remotion leaves its bundle there. Node, the modules and the browser are needed only when a
 clip is missing, and every character of the params must be in the style's fonts before Node runs.
+
+A still is the card at rest where it goes on the zone (docs/superpowers/specs/2026-11-15-card-previews-design.md):
+frame STILL_FRAME of the card STILL_FRAMES long, the last frame before its exit, as a transparent 1080x1920 PNG,
+kept as work/scenes/<still_key>.png. Its key has no reel length: a still is the same however long the card shows.
+render_stills renders the missing ones in one run of render.mjs, with TMPDIR and the jobs in a folder of its own,
+work/scenes/still-tmp-<random>, so that the review page and render can run at once; it removes that folder
+afterwards and, before it starts, any still-tmp- folder left over for more than STALE_TMP_S (an interrupted run's).
 
 setup installs the modules with `npm ci` (from the committed package-lock.json, install scripts off) and downloads
 the browser with scenes/ensure-browser.mjs, each only when it is missing. `npm ci` replaces scenes/node_modules
 whole, the browser in it too.
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,6 +48,11 @@ RENDER_TIMEOUT_S = 3600
 SETUP_TIMEOUT_S = 1800
 NODE_MISSING = "node (Node.js 18.18 or later) not found: install it, then run uv run pipeline setup"
 TOOLS_MISSING = "the Remotion modules or their browser are missing: run uv run pipeline setup"
+STILL_FRAMES = 90  # the length of the card a still is taken from
+STILL_FRAME = 81  # its last frame before the 8-frame exit (scenes/src/timing.js): every card is at rest then
+STILL_TMP = "still-tmp-"  # the prefix of the folder of a run of render_stills
+STALE_TMP_S = 3600  # a still-tmp- folder older than this is an interrupted run's (RENDER_TIMEOUT_S)
+STILLS_TIMEOUT_S = 120  # a run of render_stills ends after this: a page waits for it (a few seconds is usual)
 
 Run = Callable[..., subprocess.CompletedProcess]
 
@@ -168,6 +184,13 @@ def sources_digest(folder: Path) -> str:
     return _digest([(path.relative_to(folder).as_posix(), path.read_bytes()) for path in source_files(folder)])
 
 
+def source_inputs() -> dict[str, Path]:
+    """The source_files of scenes/ as inputs of a step, each named scenes/<its path>: what render and the storyboard
+    read when the reel shows a scene."""
+    folder = scenes_dir()
+    return {f"scenes/{path.relative_to(folder).as_posix()}": path for path in source_files(folder)}
+
+
 def style_digest(style: dict) -> str:
     """A sha256 of the style's style.json and its regular and bold fonts."""
     files = [("style.json", style["dir"] / "style.json")]
@@ -175,8 +198,15 @@ def style_digest(style: dict) -> str:
     return _digest([(name, path.read_bytes()) for name, path in files])
 
 
-def cache_key(card: str, params: dict, frames: int, style_hash: str, source_hash: str) -> str:
-    document = {"card": card, "params": params, "frames": frames, "style": style_hash, "sources": source_hash}
+def cache_key(card: str, params: dict, frames: int, align: str, style_hash: str, source_hash: str) -> str:
+    document = {"card": card, "params": params, "frames": frames, "align": align, "style": style_hash,
+                "sources": source_hash}
+    return hashlib.sha256(json.dumps(document, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def still_key(card: str, params: dict, align: str, style_hash: str, source_hash: str) -> str:
+    document = {"kind": "still", "card": card, "params": params, "align": align, "frames": STILL_FRAMES,
+                "frame": STILL_FRAME, "style": style_hash, "sources": source_hash}
     return hashlib.sha256(json.dumps(document, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -212,7 +242,7 @@ def _clips(p: Project, placed: list[Placed], style: dict) -> list[tuple[Placed, 
     folder = p.work / "scenes"
     clips = []
     for item in placed:
-        key = cache_key(item.scene["card"], item.scene["params"], item.frames, style_hash, source_hash)
+        key = cache_key(item.scene["card"], item.scene["params"], item.frames, item.align, style_hash, source_hash)
         clips.append((item, folder / f"{key}.mov"))
     return clips
 
@@ -226,6 +256,55 @@ def check_renderable(p: Project, placed: list[Placed], style: dict) -> None:
     _check_glyphs(placed, style)
     if any(not clip.is_file() for _, clip in _clips(p, placed, style)):
         _require_tools()
+
+
+def still_paths(p: Project, placed: list[Placed], style: dict) -> list[tuple[Placed, Path]]:
+    """Each of `placed` with the path of its still under work/scenes, whether it is there or not."""
+    if not placed:
+        return []
+    style_hash, source_hash = style_digest(style), sources_digest(scenes_dir())
+    folder = p.work / "scenes"
+    paths = []
+    for item in placed:
+        key = still_key(item.scene["card"], item.scene["params"], item.align, style_hash, source_hash)
+        paths.append((item, folder / f"{key}.png"))
+    return paths
+
+
+def render_stills(p: Project, placed: list[Placed], style: dict, run: Run = subprocess.run) -> list[tuple[Placed, Path]]:
+    """Each of `placed` with its still under work/scenes, rendering the stills that are not there yet; refuses
+    what render_scenes refuses before Node runs."""
+    if not placed:
+        return []
+    _check_glyphs(placed, style)
+    stills = still_paths(p, placed, style)
+    missing: dict[Path, Placed] = {}
+    for item, still in stills:
+        if not still.is_file():
+            missing.setdefault(still, item)
+    if not missing:
+        return stills
+    node = _require_tools()
+    folder = p.work / "scenes"
+    folder.mkdir(parents=True, exist_ok=True)
+    for left in folder.glob(f"{STILL_TMP}*"):
+        with contextlib.suppress(FileNotFoundError):  # another run that started at the same time removed it first
+            if left.is_dir() and left.stat().st_mtime < time.time() - STALE_TMP_S:
+                safe_rmtree(left, allowed_root=p.dir)
+    tmp = Path(tempfile.mkdtemp(prefix=STILL_TMP, dir=folder))
+    try:
+        jobs = [{"kind": "still", "card": item.scene["card"], "params": item.scene["params"], "frames": STILL_FRAMES,
+                 "frame": STILL_FRAME, "align": item.align, "out": str(still)}
+                for still, item in missing.items()]
+        _run_render_mjs(p, node, jobs, tmp / "jobs.json", tmp, style, p.work / "stills.log", run,
+                        "the card previews failed to render", STILLS_TIMEOUT_S)
+    finally:
+        safe_rmtree(tmp, allowed_root=p.dir)
+    unwritten = [still for still in missing if not still.is_file()]
+    if unwritten:
+        raise PipelineError(f"the card previews failed to render: {unwritten[0].name} was not written",
+                            log=str(p.work / "stills.log"))
+    return stills
 
 
 def render_scenes(p: Project, placed: list[Placed], style: dict, run: Run = subprocess.run) -> list[tuple[Placed, Path]]:
@@ -250,29 +329,36 @@ def _render(p: Project, folder: Path, missing: dict[Path, Placed], style: dict, 
     if tmp.exists():
         safe_rmtree(tmp, allowed_root=p.dir)
     tmp.mkdir()
-    jobs_path = folder / "jobs.json"
-    tokens = {**style["scenes"], "fonts": {"regular": style["fonts"]["regular"], "bold": style["fonts"]["bold"]}}
-    jobs = [{"card": item.scene["card"], "params": item.scene["params"], "frames": item.frames, "out": str(clip)}
+    jobs = [{"card": item.scene["card"], "params": item.scene["params"], "frames": item.frames,
+             "align": item.align, "out": str(clip)}
             for clip, item in missing.items()]
-    jobs_path.write_text(json.dumps({"style_dir": str(style["dir"]), "style": tokens, "jobs": jobs},
-                                    ensure_ascii=False, indent=1), encoding="utf-8")
     log = p.work / "scenes.log"
     try:
-        try:
-            done = run([node, str(scenes_dir() / "render.mjs"), str(jobs_path)], cwd=scenes_dir(),
-                       env={**os.environ, "TMPDIR": str(tmp)}, capture_output=True, text=True,
-                       timeout=RENDER_TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError) as error:
-            raise PipelineError(f"cannot run scenes/render.mjs: {error}") from error
+        _run_render_mjs(p, node, jobs, folder / "jobs.json", tmp, style, log, run,
+                        "the animation cards failed to render", RENDER_TIMEOUT_S)
     finally:
         safe_rmtree(tmp, allowed_root=p.dir)
-    log.write_text((done.stdout or "") + (done.stderr or ""), encoding="utf-8")
-    if done.returncode != 0:
-        raise PipelineError(f"the animation cards failed to render: {_failure(done)}", log=str(log))
     unwritten = [clip for clip in missing if not clip.is_file()]
     if unwritten:
         raise PipelineError(f"the animation cards failed to render: {unwritten[0].name} was not written",
                             log=str(log))
+
+
+def _run_render_mjs(p: Project, node: str, jobs: list[dict], jobs_path: Path, tmp: Path, style: dict, log: Path,
+                    run: Run, failed: str, timeout_s: float) -> None:
+    """Write `jobs` with the style's tokens to `jobs_path`, run render.mjs on it with TMPDIR at `tmp` for at most
+    `timeout_s` seconds, and keep what it printed in `log`; a failure is a PipelineError that starts with `failed`."""
+    tokens = {**style["scenes"], "fonts": {"regular": style["fonts"]["regular"], "bold": style["fonts"]["bold"]}}
+    jobs_path.write_text(json.dumps({"style_dir": str(style["dir"]), "style": tokens, "jobs": jobs},
+                                    ensure_ascii=False, indent=1), encoding="utf-8")
+    try:
+        done = run([node, str(scenes_dir() / "render.mjs"), str(jobs_path)], cwd=scenes_dir(),
+                   env={**os.environ, "TMPDIR": str(tmp)}, capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PipelineError(f"cannot run scenes/render.mjs: {error}") from error
+    log.write_text((done.stdout or "") + (done.stderr or ""), encoding="utf-8")
+    if done.returncode != 0:
+        raise PipelineError(f"{failed}: {_failure(done)}", log=str(log))
 
 
 def _failure(done: subprocess.CompletedProcess) -> str:

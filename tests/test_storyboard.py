@@ -21,9 +21,11 @@ import numpy as np
 import pytest
 import soundfile as sf
 from helpers import (
+    STAND_IN_CARD,
     default_edit,
     edited_project_from_documents,
     edited_project_from_script,
+    stand_in_render_stills,
     timed_sentence,
     transcript_and_trims,
     validated_storyboard,
@@ -36,7 +38,7 @@ from pipeline.captions import LONG_WORD_WARNING
 from pipeline.cli import main
 from pipeline.edit import build_segments, map_time, total_duration, validate_project
 from pipeline.errors import PipelineError
-from pipeline.media import ffprobe_bin
+from pipeline.media import ffprobe_bin, run_ffmpeg
 from pipeline.project import file_sha256, load_state, save_state
 from pipeline.review_items import review_items
 from pipeline.storyboard import build_storyboard
@@ -1610,7 +1612,7 @@ def test_approve_needs_a_storyboard_made_from_the_current_edit(edited_project, c
     assert main(["approve", p.name, "gate1"]) == 1
     assert main(["storyboard", p.name]) == 0
     assert main(["approve", p.name, "gate1"]) == 0
-    assert set(load_state(p)["gates"]["gate1"]) == {"approved_at", "storyboard_inputs"}
+    assert set(load_state(p)["gates"]["gate1"]) == {"approved_at", "kacha_version", "storyboard_inputs"}
     edit = read_json(p, "edit.json")
     edit["cuts"]["accept"].remove("t03")
     edit["cuts"]["reject"].append("t03")
@@ -1793,6 +1795,220 @@ def test_the_warnings_of_the_scenes_say_why_each_does_not_show_or_is_short(edite
         "- 警告：動畫「數字卡：兩小時／一天多撐」剪完只剩 0.6 秒，不到 1 秒。",
     ]
     assert "- 動畫：2 段" in md
+
+
+# ---- card previews ---------------------------------------------------------------------------------
+
+
+PREVIEWS_ABOUT = "樣張是卡片停住時的樣子，背景是那段動畫中間的畫面，字幕沒有畫上去。"
+
+
+def previews(html: str) -> list[tuple[bytes, str]]:
+    """(the JPEG, the caption) of each preview in the section 動畫的樣子, in order; [] when there is no section."""
+    found = re.search(r"<h2>動畫的樣子</h2>(.*?)<h2>", html, re.S)
+    if not found:
+        return []
+    return [(base64.b64decode(data), unescape(caption)) for data, caption in re.findall(
+        r'<figure><img src="data:image/jpeg;base64,([A-Za-z0-9+/=]+)"[^>]*><figcaption>(.*?)</figcaption></figure>',
+        found.group(1))]
+
+
+def middle_of(p, index: int = 0) -> tuple[int, float]:
+    """(the reel frame in the middle of the scene that shows `index`-th, the source time of that frame): the reel is
+    its segments one after the other, each as many frames as it fills."""
+    from pipeline.scenes import scene_spans
+
+    edit, transcript, trims = read_json(p, "edit.json"), read_json(p, "transcript.json"), read_json(p, "trim.json")
+    item = scene_spans(edit, transcript, trims)[index]
+    middle, first = item.start + item.frames // 2, 0
+    for segment in build_segments(edit, transcript, trims):
+        count = round(segment.end * FPS) - round(segment.start * FPS)
+        if middle < first + count:
+            return middle, (round(segment.start * FPS) + middle - first) / FPS
+        first += count
+    raise AssertionError("the middle of the scene is past the end of the reel")
+
+
+def test_each_scene_that_shows_has_a_preview_after_the_lists_in_the_order_the_scenes_show(edited_project):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03", until={"s": "s04", "char": 1}),
+                made_up_scene("s01", "keyword-pop", {"text": "省電"}, scene_id="sc2"))
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert result["warnings"] == []
+    assert re.findall(r"<h2>(.*?)</h2>", html) == ["要你決定", "其他要聽的地方", "動畫的樣子", "句子", "剪輯候選"]
+    assert f"<h2>動畫的樣子</h2>\n<p>{PREVIEWS_ABOUT}</p>" in html
+    shown = previews(html)
+    assert [caption for _, caption in shown] == [animation(html, md, "s01")[0], animation(html, md, "s03")[0]]
+    x0, y0, x1, y1 = (value // 2 for value in STAND_IN_CARD)
+    for jpeg, caption in shown:
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        assert image.shape == (960, 540, 3), caption
+        blue, green, red = (int(value) for value in image[(y0 + y1) // 2, (x0 + x1) // 2])
+        assert red > 200 and green < 60 and blue < 60, caption  # the card of the still, over the frame
+    assert "動畫的樣子" not in md and PREVIEWS_ABOUT not in md
+
+
+def test_a_preview_shows_the_frame_in_the_middle_of_its_scene_behind_the_card(edited_project):
+    """The Meijia video is a gray counter: the gray under the card says which frame is behind it."""
+    p = edited_project
+    with_scenes(p, made_up_scene("s03", until={"s": "s04", "char": 1}))
+    (jpeg, _), = previews(page(p))
+    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_GRAYSCALE)
+    below = float(image[STAND_IN_CARD[3] // 2 + 20:, :].mean())  # under the card: only the frame, no captions
+    _, at = middle_of(p)
+    assert round(below * 219 / 255 / 4) % 50 == round(at * FPS) % 50
+
+
+def test_a_preview_is_framed_as_the_reel_frames_the_shot_its_middle_is_in(edited_project, monkeypatch):
+    from pipeline import punch
+
+    p = edited_project
+    with_scenes(p, made_up_scene("s03", until={"s": "s04", "end": True}))
+    edit, transcript, trims = read_json(p, "edit.json"), read_json(p, "transcript.json"), read_json(p, "trim.json")
+    middle, at = middle_of(p)
+    plain_shots = punch.shots(edit, transcript, trims, read_json(p, "faces.json"), read_json(p, "probe.json"))
+    shot, _ = storyboard_module.reel_frame_source(plain_shots, middle)
+    edit["punch_in"] = {shot.sentence: 1.2}
+    write_json(p, "edit.json", edit)
+    shots = punch.shots(edit, transcript, trims, read_json(p, "faces.json"), read_json(p, "probe.json"))
+    shot, source = storyboard_module.reel_frame_source(shots, middle)
+    assert shot.scale == 1.2 and abs(source - at) < 1e-9
+    calls = []
+
+    def recording(args, log, **kwargs):
+        calls.append(list(args))
+        return run_ffmpeg(args, log, **kwargs)
+
+    monkeypatch.setattr("pipeline.storyboard.run_ffmpeg", recording)
+    validated_storyboard(p)
+    (args,) = [call for call in calls if "-filter_complex" in call]
+    x, y, w, h = storyboard_module.preview_crop(shot, (1080, 1920))
+    assert args[args.index("-ss") + 1] == f"{at:.3f}"
+    assert f"crop={w}:{h}:{x}:{y},scale=540:960" in args[args.index("-filter_complex") + 1]
+
+
+def test_the_crop_of_a_preview_is_the_base_window_zoomed_about_the_anchor_of_its_shot():
+    from pipeline.punch import Shot
+
+    crop = storyboard_module.preview_crop
+    assert crop(Shot(0.0, 1.0, "s01", 1, 0.5, 0.5), (1920, 1080)) == (656, 0, 606, 1080)
+    assert crop(Shot(0.0, 1.0, "s01", 1.25, 0.5, 0.2), (1920, 1080)) == (716, 44, 484, 864)
+    assert crop(Shot(0.0, 1.0, "s01", 1.25, 1.0, 1.0), (1080, 1920)) == (216, 384, 864, 1536)
+
+
+def test_a_reel_frame_is_in_the_shot_that_fills_it_at_the_source_frame_it_shows():
+    from pipeline.punch import Shot
+
+    shots = [Shot(1.0, 2.0, "s01", 1, 0.5, 0.5), Shot(3.0, 4.5, "s02", 1.25, 0.5, 0.5)]
+    find = storyboard_module.reel_frame_source
+    assert find(shots, 0) == (shots[0], 1.0)
+    assert find(shots, 29) == (shots[0], 59 / 30)
+    assert find(shots, 30) == (shots[1], 3.0)
+    assert find(shots, 35) == (shots[1], 95 / 30)
+    assert find(shots, 1000) == (shots[1], 134 / 30)  # past the end: the last frame
+
+
+def test_with_a_scene_that_shows_faces_json_and_the_card_sources_are_inputs_of_the_storyboard(edited_project):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+    validated_storyboard(p)
+    inputs = load_state(p)["steps"]["storyboard"]["inputs"]
+    assert "faces" in inputs and "scenes/render.mjs" in inputs
+    faces = read_json(p, "faces.json")
+    faces["boxes"] = [{"t": 2.0, "x0": 0.3, "y0": 0.6, "x1": 0.7, "y1": 0.97, "score": 0.9}]
+    write_json(p, "faces.json", faces)
+    assert build_storyboard(p, force=False)["skipped"] is False
+
+
+def test_without_a_scene_that_shows_neither_faces_json_nor_the_card_sources_are_inputs(edited_project):
+    p = edited_project
+    with_scenes(p, made_up_scene("s01", "keyword-pop", {"text": "省電"}))
+    remove_range(p, "s01", "s01")
+    (p.work / "faces.json").write_text("not json", encoding="utf-8")
+    result = validated_storyboard(p)
+    inputs = load_state(p)["steps"]["storyboard"]["inputs"]
+    assert "faces" not in inputs and not [name for name in inputs if name.startswith("scenes/")]
+    assert previews(Path(result["html"]).read_text(encoding="utf-8")) == []
+
+
+def cannot_make_stills(p, placed, style, run=None):
+    raise PipelineError("node not found: install Node.js 18.18 or later")
+
+
+def test_stills_that_cannot_be_made_are_a_warning_and_the_storyboard_is_made_without_previews(edited_project,
+                                                                                               monkeypatch):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+    monkeypatch.setattr("pipeline.storyboard.render_stills", cannot_make_stills)
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert result["warnings"] == ["card previews not made: node not found: install Node.js 18.18 or later"]
+    text = "動畫卡片的樣張做不出來：node not found: install Node.js 18.18 or later"
+    assert f"<li>{text}</li>" in html and f"- 警告：{text}" in md
+    assert "<h2>動畫的樣子</h2>" not in html and previews(html) == []
+    assert animation(html, md, "s03")[0].startswith("數字卡：兩小時／一天多撐（")
+
+
+def test_a_storyboard_whose_previews_were_not_made_is_made_again_rather_than_skipped(edited_project, monkeypatch):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+    monkeypatch.setattr("pipeline.storyboard.render_stills", cannot_make_stills)
+    validated_storyboard(p)
+    assert build_storyboard(p, force=False)["skipped"] is False  # tried again, and failed again
+    monkeypatch.setattr("pipeline.storyboard.render_stills", stand_in_render_stills)
+    again = build_storyboard(p, force=False)
+    assert again["skipped"] is False and again["warnings"] == []
+    assert len(previews(Path(again["html"]).read_text(encoding="utf-8"))) == 1
+    assert build_storyboard(p, force=False)["skipped"] is True
+
+
+def test_an_os_error_while_drawing_the_stills_is_a_warning_too(edited_project, monkeypatch):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+
+    def failing(p, placed, style, run=None):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("pipeline.storyboard.render_stills", failing)
+    result = validated_storyboard(p)
+    assert result["warnings"] == ["card previews not made: [Errno 28] No space left on device"]
+    assert previews(Path(result["html"]).read_text(encoding="utf-8")) == []
+
+
+def test_a_page_made_without_its_previews_is_made_again_once_the_stills_are_there(edited_project, monkeypatch):
+    """The review page can draw the stills after a storyboard could not: the next storyboard makes the page again."""
+    from pipeline.review_data import scene_stills
+
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+    monkeypatch.setattr("pipeline.storyboard.render_stills", cannot_make_stills)
+    validated_storyboard(p)
+    stills, style = scene_stills(p)
+    stand_in_render_stills(p, [item for item, _ in stills], style)  # as the review server draws them
+    monkeypatch.setattr("pipeline.storyboard.render_stills", stand_in_render_stills)
+    again = build_storyboard(p, force=False)
+    assert again["skipped"] is False and again["warnings"] == []
+    assert len(previews(Path(again["html"]).read_text(encoding="utf-8"))) == 1
+
+
+def test_a_preview_ffmpeg_cannot_make_refuses_the_storyboard(edited_project, monkeypatch):
+    p = edited_project
+    with_scenes(p, made_up_scene("s03"))
+
+    def broken(p, placed, style, run=None):
+        stills = stand_in_render_stills(p, placed, style)
+        for _, still in stills:
+            still.write_bytes(b"not a picture")
+        return stills
+
+    monkeypatch.setattr("pipeline.storyboard.render_stills", broken)
+    with pytest.raises(PipelineError) as refused:
+        validated_storyboard(p)
+    assert refused.value.extra["log"] == str(p.work / "storyboard.log")
+    assert not (p.review / "gate1").exists()
 
 
 # ---- punch-in -------------------------------------------------------------------------------------

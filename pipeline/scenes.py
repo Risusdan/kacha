@@ -1,5 +1,6 @@
 """edit.json scenes: the animation cards, the checks validate makes of them, and where each scene lands in the reel
-(docs/superpowers/specs/2026-11-15-remotion-foundation-design.md, sections 5, 6 and 9).
+(docs/superpowers/specs/2026-11-15-remotion-foundation-design.md, sections 5, 6 and 9; the title-card, bar-chart and
+versus-split cards: docs/superpowers/specs/2026-11-15-three-more-cards-design.md).
 
 A scene shows one card over the talking head: {"id", "card", "at", "until", "params"} and an optional "layout",
 which can only be "overlay". `at` is {"s": sentence id, "char": n} (char 0 when left out); `until` is
@@ -51,6 +52,7 @@ class Text(NamedTuple):
     least: int
     most: int
     optional: bool = False
+    size: str | None = None  # the group of sizes.json it is drawn with, when it is not its name
 
 
 class Items(NamedTuple):
@@ -64,17 +66,42 @@ class Items(NamedTuple):
     optional: bool = False
 
 
+class Bars(NamedTuple):
+    """A bar-chart param: from `fewest` to `most_items` bars, each {"label", "value"}: a label from `least` to `most`
+    characters wide, and a value up to `value_most` wide that starts with the number the bar's length follows
+    (bar_number). At least one of the numbers is above 0."""
+
+    name: str
+    fewest: int
+    most_items: int
+    least: int
+    most: int
+    value_most: int
+    optional: bool = False
+
+
 class Card(NamedTuple):
     label: str  # the card's name as the storyboard shows it
     impact: bool  # a big-impact effect, of which a reel may have MAX_IMPACT
-    params: tuple[Text | Items, ...]
+    params: tuple[Text | Items | Bars, ...]
 
 
 CARDS = {
     "keyword-pop": Card("重點字", False, (Text("text", 1, 10),)),
     "number-slab": Card("數字卡", False, (Text("value", 1, 6), Text("label", 0, 12, optional=True))),
     "bullet-list": Card("清單", False, (Items("items", 2, 4, 1, 12),)),
+    "title-card": Card("標題卡", False, (Text("kicker", 0, 14, optional=True), Text("title", 1, 9))),
+    "bar-chart": Card("長條圖", False, (Bars("bars", 2, 4, 1, 6, 8),)),
+    "versus-split": Card("對比", False, (
+        Text("left", 1, 5, size="side"), Text("left_note", 0, 8, optional=True, size="note"),
+        Text("right", 1, 5, size="side"), Text("right_note", 0, 8, optional=True, size="note"),
+    )),
 }
+# The number a bar-chart value starts with: Arabic digits 0-9 (not full-width ones, which JavaScript's \d leaves out
+# too), with commas between groups of three and a decimal part. A number that goes on with a digit, or with a comma or
+# a point and a digit ("2,5 倍", "1,2345", "1.5.3"), is not one: its bar would not match the text drawn beside it.
+BAR_NUMBER = re.compile(r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?")
+NUMBER_GOES_ON = re.compile(r"[0-9]|[,.][0-9]")
 LAYOUTS = ("overlay",)
 MAX_IMPACT = 3
 MAX_RUN = 2  # the same card may follow itself once, not twice
@@ -84,13 +111,15 @@ Position = tuple[int, int]  # (place of the sentence in the script, index of the
 
 
 class Placed(NamedTuple):
-    """A scene that shows in the reel: its index in edit.json scenes, the scene, the reel frame it starts at and its
-    length in frames."""
+    """A scene that shows in the reel: its index in edit.json scenes, the scene, the reel frame it starts at, its
+    length in frames and where its card goes on the top edge of the animation zone: "center", "left" or "right"
+    (pipeline.card_place)."""
 
     index: int
     scene: dict
     start: int
     frames: int
+    align: str = "center"
 
 
 class Layout(NamedTuple):
@@ -181,14 +210,51 @@ def _check_params(params: object, card: Card, path: str, errors: list[str]) -> N
         where, value = _join(path, param.name), params[param.name]
         if isinstance(param, Text):
             _check_text(value, where, param.least, param.most, errors)
-        elif not isinstance(value, list):
-            errors.append(f"{where}: must be an array of {param.fewest} to {param.most_items} items, "
+            continue
+        what = "bars" if isinstance(param, Bars) else "items"
+        if not isinstance(value, list):
+            errors.append(f"{where}: must be an array of {param.fewest} to {param.most_items} {what}, "
                           f"got {_describe(value)}")
         elif not param.fewest <= len(value) <= param.most_items:
-            errors.append(f"{where}: must have {param.fewest} to {param.most_items} items, got {len(value)}")
-        else:
+            errors.append(f"{where}: must have {param.fewest} to {param.most_items} {what}, got {len(value)}")
+        elif isinstance(param, Items):
             for k, entry in enumerate(value):
                 _check_text(entry, f"{where}[{k}]", param.least, param.most, errors)
+        else:
+            _check_bars(value, where, param, errors)
+
+
+def _check_bars(bars: list, path: str, param: Bars, errors: list[str]) -> None:
+    found, numbers = len(errors), []
+    for k, bar in enumerate(bars):
+        where = f"{path}[{k}]"
+        if not _is_object(bar, where, errors):
+            continue
+        _check_keys(bar, where, ("label", "value"), errors)
+        if "label" in bar:
+            _check_text(bar["label"], f"{where}.label", param.least, param.most, errors)
+        if "value" in bar:
+            before = len(errors)
+            _check_text(bar["value"], f"{where}.value", 1, param.value_most, errors)
+            if len(errors) == before:
+                number = bar_number(bar["value"])
+                if number is None:
+                    errors.append(f"{where}.value: must start with a number (0-9, a comma between groups of three, "
+                                  f"a point before decimals), got {_show(bar['value'])}")
+                numbers.append(number)
+    if len(errors) == found and not any(number > 0 for number in numbers):
+        errors.append(f"{path}: at least one value must be more than 0")
+
+
+def bar_number(value: str) -> float | None:
+    """The number a bar-chart value starts with, the spaces at its ends left out (BAR_NUMBER: "1,200 元" is 1200,
+    "2.5 倍" 2.5), or None when it does not start with one or the number goes on (NUMBER_GOES_ON).
+    scenes/src/number.js reads it the same way."""
+    text = value.strip()
+    match = BAR_NUMBER.match(text)
+    if match is None or NUMBER_GOES_ON.match(text, match.end()):
+        return None
+    return float(match.group().replace(",", ""))
 
 
 def _check_text(value: object, path: str, least: int, most: int, errors: list[str]) -> None:
@@ -204,36 +270,91 @@ def _check_text(value: object, path: str, least: int, most: int, errors: list[st
 
 def card_sizes() -> dict:
     """The sizes the cards are drawn at, from scenes/src/sizes.json, which the cards read too: for each card its
-    padding_x and the size and weight ("regular" or "bold") of each param's text; keyword-pop's grow, the largest
-    scale it reaches as it pops; bullet-list's tick and tick_gap, which come before each item."""
+    padding_x and padding_y and the size, weight ("regular" or "bold") and line_height of each group of its texts
+    (a param's name, or the group its Text names: versus-split's side and note); keyword-pop's grow, the largest
+    scale it reaches as it pops; number-slab's label_gap above its label; bullet-list's tick and tick_gap, which come
+    before each item, and its item_gap between items; title-card's kicker_gap under its kicker and its underline,
+    underline_gap below the title; bar-chart's label_gap under a label, the bar's height and full length (track),
+    bar_gap before the value and row_gap between bars; versus-split's note_gap above a note and its VS badge, with
+    badge_gap on either side."""
     return json.loads((repo_root() / "scenes" / "src" / "sizes.json").read_text(encoding="utf-8"))
 
 
 def card_texts_px(card: str, params: dict, fonts: dict[str, Path]) -> list[tuple[str, float]]:
-    """Each text of a card's valid params, in the card's param order (the items one by one, as items[k]), with the
-    width in pixels of the card around that text alone, at rest: the text without the spaces at its ends at its size
-    in `fonts` (weight -> font file), plus the card's padding on both sides and, before an item, the tick and its gap.
-    A character a font has no glyph for counts as one em."""
+    """Each text of a card's valid params, in the card's param order (the items one by one, as items[k]; the bars as
+    bars[k].label then bars[k].value), with the width in pixels of the card around that text alone, at rest: the text
+    without the spaces at its ends at its size in `fonts` (weight -> font file), plus the card's padding on both
+    sides and what stands beside it on its line: the tick and its gap before an item; the full bar and its gap before
+    a bar's value. A versus-split text counts twice, as both columns are as wide as its widest text, with the VS
+    badge and its gaps between them. A character a font has no glyph for counts as one em."""
     sizes = card_sizes()[card]
+    padding = 2 * sizes["padding_x"]
+
+    def width(text: str, group: str) -> float:
+        return text_px(text.strip(), fonts[sizes[group]["weight"]], sizes[group]["size"])
+
     found = []
     for param in CARDS[card].params:
         if param.name not in params:
             continue
-        size, value = sizes[param.name], params[param.name]
-        if isinstance(param, Text):
-            texts, before = [(param.name, value)], 0
+        value = params[param.name]
+        if isinstance(param, Bars):
+            beside = sizes["track"] + sizes["bar_gap"]
+            for k, bar in enumerate(value):
+                found.append((f"{param.name}[{k}].label", width(bar["label"], "label") + padding))
+                found.append((f"{param.name}[{k}].value", width(bar["value"], "value") + beside + padding))
+        elif isinstance(param, Items):
+            beside = sizes["tick"] + sizes["tick_gap"]
+            found.extend((f"{param.name}[{k}]", width(text, param.name) + beside + padding)
+                         for k, text in enumerate(value))
+        elif card == "versus-split":
+            beside = sizes["badge"] + 2 * sizes["badge_gap"]
+            found.append((param.name, 2 * width(value, param.size) + beside + padding))
         else:
-            texts = [(f"{param.name}[{k}]", text) for k, text in enumerate(value)]
-            before = sizes["tick"] + sizes["tick_gap"]
-        for key, text in texts:
-            px = text_px(text.strip(), fonts[size["weight"]], size["size"])
-            found.append((key, px + before + 2 * sizes["padding_x"]))
+            found.append((param.name, width(value, param.size or param.name) + padding))
     return found
 
 
 def card_width_px(card: str, params: dict, fonts: dict[str, Path]) -> float:
     """The width in pixels of a card at rest: that of its widest text (card_texts_px)."""
     return max(px for _, px in card_texts_px(card, params, fonts))
+
+
+def card_height_px(card: str, params: dict) -> float:
+    """The height in pixels of a card of valid params at rest, from sizes.json (card_sizes): its padding_y above and
+    below, each line at its size times its line_height, and the gaps between them. A line of an optional text is
+    there when the text is not empty. A bullet-list item is as high as its line or its tick, a bar as its value's
+    line or the bar, a versus-split as its higher column or the badge, whichever is higher."""
+    sizes = card_sizes()[card]
+
+    def line(name: str) -> float:
+        return sizes[name]["size"] * sizes[name]["line_height"]
+
+    if card == "keyword-pop":
+        inner = line("text")
+    elif card == "number-slab":
+        inner = line("value") + (sizes["label_gap"] + line("label") if _drawn(params, "label") else 0)
+    elif card == "bullet-list":
+        items = len(params["items"])
+        inner = items * max(line("items"), sizes["tick"]) + (items - 1) * sizes["item_gap"]
+    elif card == "title-card":
+        kicker = sizes["kicker_gap"] + line("kicker") if _drawn(params, "kicker") else 0
+        inner = kicker + line("title") + sizes["underline_gap"] + sizes["underline"]
+    elif card == "bar-chart":
+        bars = len(params["bars"])
+        row = line("label") + sizes["label_gap"] + max(sizes["bar"], line("value"))
+        inner = bars * row + (bars - 1) * sizes["row_gap"]
+    else:
+        columns = [line("side") + (sizes["note_gap"] + line("note") if _drawn(params, note) else 0)
+                   for note in ("left_note", "right_note")]
+        inner = max(*columns, sizes["badge"])
+    return 2 * sizes["padding_y"] + inner
+
+
+def _drawn(params: dict, name: str) -> bool:
+    """Whether a card draws the line of an optional text: it does when the text, without the spaces at its ends,
+    is not empty (the cards draw each text trimmed)."""
+    return bool((params.get(name) or "").strip())
 
 
 def _check_widths(card: str, params: dict, path: str, style: dict, errors: list[str]) -> None:
@@ -375,13 +496,17 @@ def scene_warnings(edit: dict, transcript: dict, trims: dict) -> list[str]:
 
 
 def scene_texts(scene: dict) -> list[str]:
-    """The texts of a valid scene's params, in the order of its card's params (the items of a list one by one); an
-    optional param that is left out has none."""
+    """The texts of a valid scene's params, in the order of its card's params (the items of a list one by one, each
+    bar as its label and value with a space between); an optional param that is left out has none."""
     params = scene["params"]
     found = []
     for param in CARDS[scene["card"]].params:
         value = params.get(param.name)
-        if value is not None:
+        if value is None:
+            continue
+        if isinstance(param, Bars):
+            found.extend(f"{bar['label'].strip()} {bar['value'].strip()}" for bar in value)
+        else:
             found.extend(value if isinstance(param, Items) else [value])
     return found
 

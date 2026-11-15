@@ -12,6 +12,7 @@ import pytest
 
 from pipeline.captions import LONG_WORD_WARNING
 from pipeline.cli import registered_commands
+from pipeline.scenes import CARDS
 from pipeline.edit import UNCHANGED_EDIT_WARNING
 from pipeline.render import PREVIEW_OVER
 from pipeline.scene_render import NODE_MISSING
@@ -264,8 +265,10 @@ def test_original_design_and_feature_list_point_at_the_animation_cards():
     assert SCENES_SPEC in section
     feature = FEATURE.read_text(encoding="utf-8")
     done, todo = feature.split("## 待開發")
-    for label in ("重點字", "數字卡", "清單"):
-        assert label in done, label
+    cards_todo = todo.split("- 其他 2D 動畫場景卡")[1].split("\n- ")[0]
+    for card in CARDS.values():
+        assert card.label in done, card.label
+        assert card.label not in cards_todo, card.label
     assert "推近" in done and "畫面推近" not in todo
 
 
@@ -301,3 +304,60 @@ def test_transitive_licenses_pass():
         [sys.executable, str(ROOT / "scripts" / "third_party.py"), "--check"], capture_output=True, text=True
     )
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_the_docs_say_the_cards_can_be_seen_before_the_approval():
+    """The gate-1 page has a preview of each card and the review page lays the card over the video; the stills are a
+    warning when they cannot be made; and only the sound preview is left of gate 2."""
+    from pipeline.storyboard import STILLS_FAILED
+
+    reel, storyboard = DOCS[1].read_text(encoding="utf-8"), DOCS[2].read_text(encoding="utf-8")
+    assert f"`{STILLS_FAILED.strip()}`" in reel and "動畫的樣子" in reel
+    assert "動畫的樣子" in storyboard and "`work/faces.json`" in storyboard.split("## scenes：動畫")[1]
+    feature = FEATURE.read_text(encoding="utf-8")
+    done, todo = feature.split("## 待開發")
+    assert "動畫的樣子" in done
+    gate2 = next(line for line in todo.splitlines() if "關卡 2" in line)
+    assert "有聲預覽" in gate2 and "樣張" not in gate2
+    for path in (*DOCS, FEATURE, ROOT / "README.md", ROOT / "docs/features.md"):
+        assert "不播真的動畫" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_the_docs_explain_the_version():
+    """Spec 2026-11-15-versioning-design, section 8: CLAUDE.md holds the bump rule but not the publish recipe (it
+    ships, and the publish setup is the maintainer's), the reel skill reads version and made_with (never the record
+    key), the README asks for the version in an Issue and shows what one looks like, and each finished feature in
+    FEATURE.md says which version brought it."""
+    claude = DOCS[0].read_text(encoding="utf-8")
+    for text in ("docs/superpowers/specs/2026-11-15-versioning-design.md", "pyproject.toml", "uv lock"):
+        assert text in claude, text
+    assert "v<版本>" not in claude and "`public`" not in claude
+    reel = DOCS[1].read_text(encoding="utf-8")
+    assert "made_with" in reel and "`version`" in reel and "kacha_version" not in reel
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    issues = readme.split("### 出問題找誰？")[1].split("\n#")[0]
+    assert "版本" in issues and re.search(r"例如 \d+\.\d+\.\d+", issues)
+    feature = FEATURE.read_text(encoding="utf-8")
+    done = [part for part in feature.split("\n## ") if part.startswith("已完成")]
+    headings = [line for part in done for line in part.splitlines() if line.startswith("### ")]
+    assert headings
+    for heading in headings:
+        assert heading.endswith(("（0.1.0）", "（0.2.0）")), heading
+    previews = [line for part in done for line in part.splitlines() if line.startswith("- ") and "樣張" in line]
+    assert previews
+    for line in previews:  # card previews came in 0.2.0, so every item that speaks of them says so
+        assert line.endswith("（0.2.0）"), line
+
+
+STEP_NAMES = {"prep": "前處理", "transcribe": "轉錄", "trim": "粗剪", "storyboard": "分鏡稿", "render": "輸出",
+              "review_video": "審閱用影片", "preview": "手機預覽版"}
+
+
+def test_the_reel_skill_names_every_step_made_with_can_list():
+    """made_with lists each done step by its record name; the skill gives Claude a Chinese name for each, and a
+    step added later fails here until it has one."""
+    source = "".join(path.read_text(encoding="utf-8") for path in (ROOT / "pipeline").glob("*.py"))
+    assert set(re.findall(r'run_step\(\w+, "([a-z_0-9]+)"', source)) == set(STEP_NAMES)
+    paragraph = next(line for line in DOCS[1].read_text(encoding="utf-8").splitlines() if line.startswith("版本號："))
+    for name in STEP_NAMES.values():
+        assert name in paragraph, name

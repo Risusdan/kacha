@@ -21,8 +21,10 @@ size of the picture the render reads (prep's SDR copy for an HDR source), which 
 
 The animation cards (pipeline.scenes, docs/superpowers/specs/2026-11-15-remotion-foundation-design.md) are laid over
 the picture after zoompan: each scene that shows is a transparent clip under work/scenes (pipeline.scene_render), which
-is rendered before ffmpeg runs when it is not there yet, and overlaid from the reel frame the scene starts at. A reel
-without scenes reads nothing of scenes/ and runs no Node.
+is rendered before ffmpeg runs when it is not there yet, and overlaid from the reel frame the scene starts at. Each
+card is drawn on the top edge of the animation zone, centred or to one side, away from the speaker's head as
+work/faces.json and the shots put it on the screen (pipeline.card_place). A reel without scenes reads nothing of
+scenes/ and runs no Node.
 
 The captions are burnt in last, over the cards, at the fixed top caption_top_px gives (the style's captions.bottom_px
 less its line height), whatever the picture shows and however far it is punched in.
@@ -52,8 +54,8 @@ from pipeline.errors import PipelineError
 from pipeline.media import FFPROBE_TIMEOUT_S, ffprobe_json, probe, run_ffmpeg
 from pipeline.project import Project, first_stale_step, gate_ok, run_step
 from pipeline.punch import Shot, base_window, window
-from pipeline.scene_render import check_renderable, render_scenes, source_files
-from pipeline.scenes import scene_spans
+from pipeline.scene_render import check_renderable, render_scenes
+from pipeline.card_place import placed_scenes
 from pipeline.style import font_path, load_style
 from pipeline.voice import treat_voice
 from pipeline.words import caption_inputs
@@ -487,9 +489,11 @@ class _Plan:
                 characters=missing,
             )
         self.top_px = caption_top_px(self.style)
-        # The scenes that show, each with its reel frame and its length; what would stop their clips from being
-        # rendered is refused here, before anything is touched (no scenes: scenes/ is not read, Node not run).
-        self.placed = scene_spans(edit, transcript, trims)
+        # The scenes that show, each with its reel frame, its length and the side of the zone its card goes to, away
+        # from the head; what would stop their clips from being rendered is refused here, before anything is
+        # touched (no scenes: scenes/ is not read, Node not run).
+        self.placed = placed_scenes(edit, transcript, trims, self.style, faces.get("boxes", []), self.shots,
+                                    (picture.display_w, picture.display_h))
         check_renderable(p, self.placed, self.style)
 
 
@@ -547,10 +551,7 @@ def _make(p: Project, plan: _Plan, final: Path, runner: Callable) -> dict:
 def _card_sources(plan: _Plan) -> dict[str, Path]:
     """The card sources (scene_render.source_files) as inputs named scenes/<their path>, when the reel shows a
     scene; none otherwise, so that a reel without scenes does not read scenes/."""
-    if not plan.placed:
-        return {}
-    folder = scene_render.scenes_dir()
-    return {f"scenes/{path.relative_to(folder).as_posix()}": path for path in source_files(folder)}
+    return scene_render.source_inputs() if plan.placed else {}
 
 
 def render(p: Project, force: bool = False, runner: Callable = run_ffmpeg) -> dict:
@@ -601,7 +602,7 @@ def render(p: Project, force: bool = False, runner: Callable = run_ffmpeg) -> di
         "audio": p.work / "audio48k.wav",
         "video": plan.video,
         "probe": p.work / "probe.json",
-        "faces": p.work / "faces.json",  # the anchors of the punch-in
+        "faces": p.work / "faces.json",  # the anchors of the punch-in, and where the cards go
         **caption_inputs(),  # the caption lines are broken where these say a word ends
         **_card_sources(plan),  # what the cards look like, when there are any
     }

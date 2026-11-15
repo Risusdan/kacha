@@ -17,6 +17,7 @@ from pipeline.errors import AsrTruncatedError, EditInvalid, PipelineError, Unsaf
 from pipeline.project import PROJECT_BUSY_ERROR, ProjectBusy, ProjectLock
 from pipeline.review_video import review_video_path
 from pipeline.storyboard import NOT_VALIDATED_REFUSAL
+from pipeline.version import kacha_version
 
 
 def test_unknown_command_prints_json_error(capsys):
@@ -195,6 +196,11 @@ def test_help_lists_every_command_and_returns_0(capsys):
         assert name in out
 
 
+def test_help_names_the_version_flag(capsys):
+    assert main(["--help"]) == 0
+    assert "pipeline --version" in capsys.readouterr().out
+
+
 def test_long_help_flag_returns_0(capsys):
     assert main(["--help"]) == 0
     assert "usage" in capsys.readouterr().out
@@ -281,6 +287,9 @@ def fake_review_server(on_wait):
             self.p, self.port, self.url = p, 4321, REVIEW_URL
             self.stopped = threading.Event()
 
+        def ensure_stills(self) -> None:
+            pass
+
         def start(self) -> str:
             return self.url
 
@@ -363,3 +372,36 @@ def test_leak_probe_registers_a_command():
 def test_test_commands_do_not_leak():
     # Runs right after test_leak_probe_registers_a_command, which registered "_leak_probe".
     assert "_leak_probe" not in registered_commands()
+
+
+# ---- the version (spec 2026-11-15-versioning-design, section 4) ------------------------------------------------
+
+
+def _one_line(capsys) -> dict:
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    return json.loads(lines[0])
+
+
+def test_version_prints_the_version(capsys):
+    assert main(["--version"]) == 0
+    assert _one_line(capsys) == {"ok": True, "version": kacha_version()}
+
+
+@pytest.mark.parametrize("argv", [["--version", "status"], ["status", "--version"]])
+def test_version_with_other_arguments_is_a_usage_error(capsys, argv):
+    assert main(argv) == 1
+    assert _one_line(capsys)["ok"] is False
+
+
+def test_status_reports_the_version(capsys, project, studio):
+    broken = studio / "projects" / "2026-11-13-broken"
+    broken.mkdir()
+    (broken / "state.json").write_text("not json", encoding="utf-8")
+    assert main(["status"]) == 0
+    listing = _one_line(capsys)
+    assert listing["version"] == kacha_version()
+    assert [entry["name"] for entry in listing["projects"]] == [project.name, broken.name]
+    assert "error" in listing["projects"][1]
+    assert main(["status", project.name]) == 0
+    assert _one_line(capsys)["version"] == kacha_version()

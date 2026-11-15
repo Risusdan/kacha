@@ -705,3 +705,92 @@ describe("the player shows the label of the animation that plays", () => {
     assert.equal($("scene").hidden, true);
   });
 });
+
+describe("the player lays the still of a card over the video while its scene plays", () => {
+  const LABEL = "動畫：數字卡　兩小時／一天多撐";
+  const STILL = `scene-stills/${"ab".repeat(32)}.png`;
+  const OTHER = `scene-stills/${"cd".repeat(32)}.png`;
+
+  function at(t) {
+    const video = $("video");
+    video.currentTime = t;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+  }
+
+  function loaded(image) {
+    image.dispatchEvent(new FakeEvent("load"));
+  }
+
+  test("a scene with a still shows the still instead of its label, and neither shows before or after", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: STILL }];
+    await openPage(server);
+    const still = $("scene-still");
+    at(1);
+    assert.equal(still.hidden, true);
+    at(3);
+    assert.equal(still.src, STILL);
+    assert.equal(still.hidden, true); // until it has loaded: the image would still show what it held before
+    loaded(still);
+    assert.equal(still.hidden, false);
+    assert.equal(still.alt, LABEL);
+    assert.equal($("scene").hidden, true);
+    at(4.5);
+    assert.equal(still.hidden, true);
+    assert.equal($("scene").hidden, true);
+  });
+
+  test("a scene without a still shows its label and no still", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: null }];
+    await openPage(server);
+    at(3);
+    assert.equal($("scene-still").hidden, true);
+    assert.equal($("scene").hidden, false);
+    assert.equal($("scene").textContent, LABEL);
+  });
+
+  test("a reload that gives the scene another still shows the new one on the paused video", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: STILL }];
+    await openPage(server);
+    at(3);
+    loaded($("scene-still"));
+    server.claude((s) => { s.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: OTHER }]; });
+    await poll();
+    assert.equal(notice().textContent, UPDATED_TEXT);
+    assert.equal($("scene-still").src, OTHER);
+    assert.equal($("scene-still").hidden, true);
+    loaded($("scene-still"));
+    assert.equal($("scene-still").hidden, false);
+  });
+
+  test("the next scene does not show the still of the one before while its own loads", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: STILL },
+                          { start: 4.5, end: 6.5, label: LABEL, still: OTHER }];
+    await openPage(server);
+    at(3);
+    loaded($("scene-still"));
+    at(5);
+    assert.equal($("scene-still").src, OTHER);
+    assert.equal($("scene-still").hidden, true);
+    loaded($("scene-still"));
+    assert.equal($("scene-still").hidden, false);
+  });
+
+  test("a still that does not load shows the label instead, also the next time the scene plays", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL, still: STILL }];
+    await openPage(server);
+    at(3);
+    $("scene-still").dispatchEvent(new FakeEvent("error"));
+    assert.equal($("scene-still").hidden, true);
+    assert.equal($("scene").hidden, false);
+    assert.equal($("scene").textContent, LABEL);
+    at(1);
+    at(3);
+    assert.equal($("scene-still").hidden, true);
+    assert.equal($("scene").textContent, LABEL);
+  });
+});

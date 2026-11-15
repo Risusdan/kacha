@@ -2,6 +2,7 @@
 
 Exit codes: 0 success, 1 execution error (including bad arguments, an unexpected exception, and a
 handler result that says `"ok": false`), 2 invalid edit.json. Help text is plain text on stdout, exit 0.
+`pipeline --version`, with no other argument, prints {"ok": true, "version": …} (pipeline.version).
 The review command prints one more line first, while it serves (see _review). storyboard, approve and render
 hold the project's lock (project.ProjectLock) while they run, and refuse with exit code 1 while another of them,
 or the review page's approval job, holds it.
@@ -39,6 +40,7 @@ from pipeline.review_server import ReviewServer, serve_review
 from pipeline.scene_render import setup_scenes
 from pipeline.storyboard import build_storyboard
 from pipeline.trim import trim
+from pipeline.version import kacha_version
 
 Handler = Callable[[argparse.Namespace], dict]
 ArgSpec = tuple[str, dict]
@@ -73,7 +75,9 @@ class _JsonArgumentParser(argparse.ArgumentParser):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = _JsonArgumentParser(prog="pipeline")
+    # --version is handled in main before parsing (alone only); the epilog names it in the help.
+    parser = _JsonArgumentParser(prog="pipeline",
+                                 epilog="pipeline --version prints the version of kacha as one line of JSON.")
     # No metavar: the top-level help then lists every registered subcommand name.
     subparsers = parser.add_subparsers(dest="command", required=True, title="commands")
     for name in registered_commands():
@@ -99,6 +103,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace | int:
 
 def main(argv: list[str] | None = None) -> int:
     try:
+        if (sys.argv[1:] if argv is None else argv) == ["--version"]:
+            _emit({"ok": True, "version": kacha_version()})
+            return 0
         args = _parse(argv)
         if isinstance(args, int):
             return args
@@ -138,8 +145,8 @@ def _listed(project: Project) -> dict:
 @command("status", args=[("name", {"nargs": "?"})])
 def _status(args: argparse.Namespace) -> dict:
     if args.name is None:
-        return {"projects": [_listed(p) for p in list_projects()]}
-    return project_status(load_project(args.name))
+        return {"version": kacha_version(), "projects": [_listed(p) for p in list_projects()]}
+    return {"version": kacha_version(), **project_status(load_project(args.name))}
 
 
 @command("approve", args=[("name", {}), ("gate", {})])

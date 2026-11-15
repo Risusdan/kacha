@@ -49,3 +49,36 @@ export function stagger(count, duration) {
 export function tickProgress(frame, start) {
   return clamp01((frame - start) / TICK_FRAMES);
 }
+
+// A bar of a bar chart grows in this many frames, then its value fades in in this many, on a long enough card.
+export const GROW_FRAMES = 12;
+export const VALUE_FRAMES = 6;
+
+/**
+ * When each of `count` bars starts to grow, and how many frames a bar grows in and its value fades in in, so that
+ * every value is in by the middle of the frames between the end of the entrance and the start of the exit, and the
+ * second half is left for reading them. The bars start one after another from the end of the entrance; when there
+ * are not GROW_FRAMES + VALUE_FRAMES frames to the middle, they all start then, and grow and fade in in proportion.
+ */
+export function barTimes(count, duration) {
+  const { enter, exit } = inOut(duration);
+  const end = Math.max(enter, duration - 1 - exit);
+  const room = Math.floor((end - enter) / 2);
+  let grow = GROW_FRAMES;
+  let value = VALUE_FRAMES;
+  if (room < GROW_FRAMES + VALUE_FRAMES) {
+    grow = Math.round((room * GROW_FRAMES) / (GROW_FRAMES + VALUE_FRAMES));
+    value = room - grow;
+  }
+  const last = enter + room - grow - value;
+  const step = count > 1 ? (last - enter) / (count - 1) : 0;
+  return { starts: Array.from({ length: count }, (_, index) => enter + Math.round(index * step)), grow, value };
+}
+
+/** 0 until frame `start`, 1 `length` frames later (from `start` itself when `length` is 0). */
+export function barProgress(frame, start, length) {
+  if (length === 0) {
+    return frame >= start ? 1 : 0;
+  }
+  return clamp01((frame - start) / length);
+}

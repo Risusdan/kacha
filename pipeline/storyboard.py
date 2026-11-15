@@ -38,6 +38,17 @@ a thumbnail but no time. A sentence the speaker did not say shows only "沒講�
 line that starts or ends inside a long word says so, and adds LONG_WORD_WARNING to the warnings. A row
 that list items are about names their numbers. A sentence row has no clip.
 
+After the two lists, a reel with a scene that shows has the section 動畫的樣子: a sentence (PREVIEWS_ABOUT), then
+one preview of each scene that shows, in the order they show, each with its card's name, texts and span in the reel
+under it, as the 動畫 cell has them. A preview is a PREVIEW_W x PREVIEW_H JPEG of the reel at the frame in the middle of
+the scene (reel_frame_source): the source frame there, framed as the shot it is in frames it (preview_crop), with the
+still of the card (scene_render.render_stills: the card at rest where it goes, card_place.placed_scenes) laid over it;
+no captions. The cards go where the faces of work/faces.json leave room, so faces.json and the card sources are
+inputs of the step when a scene shows, and neither is read when none does. Stills that cannot be made (no Node, a
+character the fonts cannot draw, Remotion failing) are a warning, STILLS_FAILED and the reason, and the page has no
+such section; a storyboard made without its stills is made again by the next storyboard command rather than skipped.
+A preview ffmpeg cannot make refuses the storyboard, as a thumbnail does. storyboard.md has no previews.
+
 The summary counts the scenes that show (動畫 N 段). A scene that does not show, or shows for less than
 scenes.MIN_SCENE_FRAMES, is a warning: its scene_warning (English, with its index) in the result for Claude, a
 sentence in Chinese that names it by its card and texts on the page and in storyboard.md.
@@ -61,28 +72,37 @@ from pathlib import Path
 
 import soundfile as sf
 
+from pipeline import punch
 from pipeline.captions import LONG_WORD_WARNING, Line, build_events
+from pipeline.card_place import placed_scenes
 from pipeline.edit import (
     FPS,
     Segment,
     build_segments,
     kept_sentences,
+    load_document,
     map_time,
     require_valid,
     total_duration,
 )
 from pipeline.errors import PipelineError
+from pipeline.media import probe as probe_video
 from pipeline.media import run_ffmpeg
 from pipeline.project import Project, edit_stage, run_step
-from pipeline.punch import framings
-from pipeline.scenes import MIN_SCENE_FRAMES, Layout, scene_label, scene_layout, scene_warning
+from pipeline.punch import Shot, base_window, framings, window
+from pipeline.scenes import MIN_SCENE_FRAMES, Layout, Placed, scene_label, scene_layout, scene_spans, scene_warning
 from pipeline.review_items import TRIM_PAD_S, Item, review_items, trims_in_reel
 from pipeline.safe_delete import safe_rmtree
+from pipeline.scene_render import render_stills, source_inputs, still_paths
 from pipeline.style import font_path, load_style
 from pipeline.trim import FEW_PAUSES_WARNING
 from pipeline.words import caption_inputs
 
 THUMB_W = 270  # width of a thumbnail in pixels; the page shows it 90 px wide (three times for a sharp phone screen)
+PREVIEW_W, PREVIEW_H = 540, 960  # a card preview in pixels; the page shows it at most 270 px wide
+PREVIEWS_ABOUT = "樣張是卡片停住時的樣子，背景是那段動畫中間的畫面，字幕沒有畫上去。"
+STILLS_FAILED = "card previews not made: "  # and the reason
+PREVIEWS_HEADING = "<h2>動畫的樣子</h2>"
 AUDIO_BITRATE = "64k"
 MEDIA_DIR = "gate1-media"  # under work/
 DASH = "—"
@@ -185,6 +205,16 @@ class _Trim:
 
 
 @dataclass
+class _Preview:
+    placed: Placed
+    label: str  # the card's name, its texts and its span in the reel (_scene_text)
+    at: float  # source time of the frame in the middle of the scene
+    crop: tuple[int, int, int, int]  # x, y, w, h of what the reel shows of the picture then (preview_crop)
+    still: Path | None = None  # the still of the card, filled in by _draw_stills
+    uri: str = ""  # data URI, filled in by _Media
+
+
+@dataclass
 class _Plan:
     project: str
     video: Path
@@ -199,6 +229,8 @@ class _Plan:
     listen: list[_ListItem]
     sentences: list[_Sentence]
     trims: list[_Trim]
+    style: dict
+    previews: list[_Preview]  # emptied by _draw_stills when the stills cannot be made
 
 
 def _document(path: Path, step: str, keys: tuple[str, ...]) -> dict:
@@ -292,16 +324,88 @@ def _framing_text(shots: list[tuple[float, float, float]], segments: list[Segmen
                     for start, end, scale in shots)
 
 
+def _scene_text(item: Layout | Placed) -> str:
+    """A scene that shows as its card's name, its texts and its span in the reel: 數字卡：兩小時／一天多撐（0:12.0 到 0:14.5）."""
+    name, texts = scene_label(item.scene)
+    return f"{name}：{texts}（{clock(item.start / FPS)} 到 {clock((item.start + item.frames) / FPS)}）"
+
+
 def _animation_texts(layout: list[Layout]) -> dict[str, str]:
-    """Sentence id -> the scenes that show and start in it, in edit.json order, each as its card's name, its texts
-    and its span in the reel (數字卡：兩小時／一天多撐（0:12.0 到 0:14.5）), joined by 、."""
+    """Sentence id -> the scenes that show and start in it, in edit.json order, each as _scene_text, joined by 、."""
     found: dict[str, list[str]] = {}
     for item in layout:
         if item.gone is None and item.frames > 0:
-            name, texts = scene_label(item.scene)
-            span = f"{clock(item.start / FPS)} 到 {clock((item.start + item.frames) / FPS)}"
-            found.setdefault(item.scene["at"]["s"], []).append(f"{name}：{texts}（{span}）")
+            found.setdefault(item.scene["at"]["s"], []).append(_scene_text(item))
     return {sid: "、".join(texts) for sid, texts in found.items()}
+
+
+def reel_frame_source(shots: list[Shot], frame: int) -> tuple[Shot, float]:
+    """The shot that reel frame `frame` is in and the source time of the frame it shows there. The reel is the shots
+    one after the other, each as many frames as render's select keeps of it, from round(start * FPS) to the frame
+    before round(end * FPS); a frame past the end is the last one."""
+    first = 0
+    for shot in shots:
+        begin = round(shot.start * FPS)
+        count = round(shot.end * FPS) - begin
+        if frame < first + count:
+            return shot, (begin + max(0, frame - first)) / FPS
+        first += count
+    last = shots[-1]
+    return last, (round(last.end * FPS) - 1) / FPS
+
+
+def _nearest_even(value: float) -> int:
+    return round(value / 2) * 2
+
+
+def preview_crop(shot: Shot, picture: tuple[int, int]) -> tuple[int, int, int, int]:
+    """(x, y, w, h) in pixels of the picture, (w, h) as ffmpeg delivers it, of what the reel shows in `shot`: the base
+    window (punch.base_window) zoomed about the shot's anchor (punch.window), each value to the nearest even pixel as
+    render's zoompan has the corner, and kept inside the base window."""
+    bx, by, bw, bh = base_window(*picture)
+    left, top, size, _ = window((shot.ax, shot.ay), shot.scale)
+    w, h = _nearest_even(bw * size), _nearest_even(bh * size)
+    return bx + min(_nearest_even(left * bw), bw - w), by + min(_nearest_even(top * bh), bh - h), w, h
+
+
+def _previews(p: Project, edit: dict, transcript: dict, trims: dict, style: dict, video: Path) -> list[_Preview]:
+    """A preview of each scene that shows, in the order they show, with its card placed as render places it: from
+    the face boxes of faces.json and the shots of the picture of `video` as ffmpeg delivers it (media.probe). When no
+    scene shows, nothing is read and there is none."""
+    if not scene_spans(edit, transcript, trims):
+        return []
+    faces = load_document(p.work / "faces.json", "prep", ("boxes",))
+    info = probe_video(video)
+    picture = (info.display_w, info.display_h)
+    shots = punch.shots(edit, transcript, trims, faces, {"display_w": picture[0], "display_h": picture[1]})
+    found = []
+    for item in sorted(placed_scenes(edit, transcript, trims, style, faces.get("boxes", []), shots, picture),
+                       key=lambda item: item.start):
+        shot, at = reel_frame_source(shots, item.start + item.frames // 2)
+        found.append(_Preview(item, _scene_text(item), at, preview_crop(shot, picture)))
+    return found
+
+
+def still_failure(error: PipelineError | OSError) -> str:
+    """Why stills could not be made, in English: a PipelineError's message, or what an OSError says."""
+    return error.message if isinstance(error, PipelineError) else str(error)
+
+
+def _draw_stills(p: Project, plan: _Plan) -> None:
+    """Give each preview the still of its card (render_stills). Stills that cannot be made leave the plan without
+    previews and add STILLS_FAILED to its warnings."""
+    if not plan.previews:
+        return
+    try:
+        stills = render_stills(p, [preview.placed for preview in plan.previews], plan.style)
+    except (PipelineError, OSError) as error:
+        reason = still_failure(error)
+        plan.warnings.append((f"{STILLS_FAILED}{reason}", f"動畫卡片的樣張做不出來：{reason}"))
+        plan.previews = []
+        return
+    by_index = {item.index: still for item, still in stills}
+    for preview in plan.previews:
+        preview.still = by_index[preview.placed.index]
 
 
 def _scene_warnings(layout: list[Layout]) -> list[tuple[str, str]]:
@@ -385,11 +489,12 @@ def _plan(p: Project) -> _Plan:
     notes = edit.get("notes", {})
     framed = framings(edit, transcript, trims)
     layout = scene_layout(edit, transcript, trims)
+    video = Path(probe["video_source"])
     codes = list(probe.get("warnings") or []) + list(trims.get("warnings", [])) + (
         [LONG_WORD_WARNING] if long_word else [])
     return _Plan(
         project=p.name,
-        video=Path(probe["video_source"]),
+        video=video,
         source_s=float(probe["duration_s"]),
         duration_s=total_duration(segments),
         cuts=len(accepted & inside) + len(edit["cuts"].get("extra", [])),
@@ -402,6 +507,8 @@ def _plan(p: Project) -> _Plan:
         sentences=_sentence_rows(edit, transcript, segments, captions, decisions + listen, framed,
                                  _animation_texts(layout)),
         trims=_trim_rows(trims, accepted, inside, decisions + listen),
+        style=style,
+        previews=_previews(p, edit, transcript, trims, style, video),
     )
 
 
@@ -434,6 +541,8 @@ class _Media:
                     sentence.thumb = self._thumbnail(sentence.thumb_at)
             for trim in plan.trims:
                 trim.clip.uri = self._clip(*trim.clip.span)
+            for preview in plan.previews:
+                preview.uri = self._preview(preview)
         finally:
             with contextlib.suppress(OSError):  # only an empty folder is removed
                 self.folder.rmdir()
@@ -456,6 +565,18 @@ class _Media:
         args = ["-ss", f"{t:.3f}", "-i", str(self.video), "-frames:v", "1", "-vf", f"scale={THUMB_W}:-2",
                 "-q:v", "4"]
         return self._embed(f"thumb-{self.count}.jpg", args, "image/jpeg", f"frame at {t:.2f}s of {self.video}")
+
+    def _preview(self, preview: _Preview) -> str:
+        """The frame of the video at the preview's source time, cropped as the reel frames it, scaled to PREVIEW_W x
+        PREVIEW_H, with the still of the card scaled to the same size laid over it, as a JPEG."""
+        self.count += 1
+        x, y, w, h = preview.crop
+        graph = (f"[0:v]crop={w}:{h}:{x}:{y},scale={PREVIEW_W}:{PREVIEW_H},setsar=1[frame];"
+                 f"[1:v]scale={PREVIEW_W}:{PREVIEW_H}[card];[frame][card]overlay=format=auto")
+        args = ["-ss", f"{preview.at:.3f}", "-i", str(self.video), "-i", str(preview.still),
+                "-filter_complex", graph, "-frames:v", "1", "-q:v", "4"]
+        return self._embed(f"preview-{self.count}.jpg", args, "image/jpeg",
+                           f"card preview at {preview.at:.2f}s of {self.video}")
 
     def _clip(self, start: float, end: float) -> str:
         """The audio from `start` to `end` (source seconds, kept inside the audio) as mono AAC in an m4a."""
@@ -500,6 +621,10 @@ th { background: #f5f5f5; font-size: 0.85rem; white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td.id, td.time { white-space: nowrap; }
 img { display: block; width: 90px; height: auto; border-radius: 4px; }
+.previews { display: flex; flex-wrap: wrap; gap: 12px; }
+.previews figure { flex: 0 1 270px; max-width: 270px; margin: 0; }
+.previews img { width: 100%; border: 1px solid #d6d6d6; border-radius: 8px; }
+.previews figcaption { margin-top: 4px; font-size: 0.9rem; overflow-wrap: anywhere; }
 .play { margin-top: 6px; padding: 8px 16px; min-height: 40px; font: inherit; color: #1b1b1b; background: #f5f5f5;
   border: 1px solid #b8b8b8; border-radius: 8px; cursor: pointer; }
 .hint { margin-left: 8px; color: #666; font-size: 0.8rem; }
@@ -519,6 +644,7 @@ tr.kept td:first-child { box-shadow: inset 4px 0 0 #2e7d32; }
   tr.cut td:first-child, tr.kept td:first-child { box-shadow: none; }
   tr.cut { box-shadow: inset 4px 0 0 #b00020; }
   tr.kept { box-shadow: inset 4px 0 0 #2e7d32; }
+  .previews { flex-direction: column; }
 }
 """
 
@@ -689,6 +815,16 @@ def _figures(plan: _Plan) -> list[tuple[str, str]]:
             ("要你決定", f"{len(plan.decisions)} 項"), ("其他要聽", f"{len(plan.listen)} 處")]
 
 
+def _previews_html(previews: list[_Preview]) -> str:
+    """The section 動畫的樣子, or nothing when there is no preview."""
+    if not previews:
+        return ""
+    figures = "".join(
+        f'<figure><img src="{preview.uri}" alt="{_esc(preview.label)}" width="{PREVIEW_W}" height="{PREVIEW_H}">'
+        f"<figcaption>{_esc(preview.label)}</figcaption></figure>" for preview in previews)
+    return f'{PREVIEWS_HEADING}\n<p>{PREVIEWS_ABOUT}</p>\n<div class="previews">{figures}</div>\n'
+
+
 def _html(plan: _Plan) -> str:
     summary = "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in _figures(plan))
     warnings = ""
@@ -709,7 +845,7 @@ def _html(plan: _Plan) -> str:
         f'<h1>關卡 1 分鏡稿</h1>\n<p class="project">{_esc(plan.project)}</p>\n'
         f'<section class="summary">\n<dl>{summary}</dl>{warnings}\n</section>\n'
         f"<h2>要你決定</h2>\n{_list_html(plan.decisions, _NO_DECISIONS)}\n"
-        f"<h2>其他要聽的地方</h2>\n{_list_html(plan.listen, _NO_LISTEN)}\n"
+        f"<h2>其他要聽的地方</h2>\n{_list_html(plan.listen, _NO_LISTEN)}\n{_previews_html(plan.previews)}"
         f"<h2>句子</h2>\n{sentences}\n<h2>剪輯候選</h2>\n{trims}\n"
         f"<script>\n{_PLAYER_JS}</script>\n</body>\n</html>\n"
     )
@@ -821,7 +957,8 @@ def build_storyboard(p: Project, force: bool = True) -> dict:
     run. Returns html, md (paths), duration_s (the cut reel), source_s, cuts (the accepted candidates in
     the reel plus the cuts.extra ranges), decisions and listen_points (how many items the two lists of
     review_items hold), warnings (the codes of probe.json and of trim.json, then LONG_WORD_WARNING when a
-    caption line cuts a long word) and skipped.
+    caption line cuts a long word, the scene warnings, and STILLS_FAILED with its reason when the stills of the
+    previews cannot be made) and skipped.
 
     The step is recorded with the edit.json it was made from under the input name "edit", which
     approve checks. A call from code rebuilds every time; the storyboard command passes its --force
@@ -834,7 +971,11 @@ def build_storyboard(p: Project, force: bool = True) -> dict:
 
     The caption word list and the dictionary (words.caption_inputs) are inputs of the step as well: the
     lines on the page are broken where they say a word ends, so a change to either makes the page stale
-    and an approval of it void."""
+    and an approval of it void. So are faces.json and the card sources (scene_render.source_inputs) when a scene
+    shows: the previews place the cards by the faces and draw them with that code. A storyboard is not skipped when
+    the still of a preview is missing from work/scenes (it could not be made, or was removed), or when a scene shows
+    and the page has no previews (the stills were made since): it is made again, so that the result says what the
+    page says."""
     edit, transcript, trims = require_valid(p)
     stage = edit_stage(p)
     if stage == "edit":
@@ -845,6 +986,9 @@ def build_storyboard(p: Project, force: bool = True) -> dict:
     if not (p.work / "probe.json").is_file():  # run_step would only say that an input is not found
         raise PipelineError(PROBE_MISSING)
     style = load_style(edit["style"])
+    probe = _document(p.work / "probe.json", "prep", ("video_source",))
+    placed = [preview.placed for preview in
+              _previews(p, edit, transcript, trims, style, Path(probe["video_source"]))]
     page_path, md_path = p.review / "gate1" / "index.html", p.review / "gate1" / "storyboard.md"
     inputs = {
         "edit": p.edit_path,
@@ -854,17 +998,22 @@ def build_storyboard(p: Project, force: bool = True) -> dict:
         "audio": p.work / "audio48k.wav",
         "probe": p.work / "probe.json",
         **caption_inputs(),  # the caption lines on the page are broken where these say a word ends
+        **({"faces": p.work / "faces.json", **source_inputs()} if placed else {}),  # where the cards go, how they look
     }
+    # A page without its previews is made again: the stills may have been made since (by the review page).
+    unmade = any(not still.is_file() for _, still in still_paths(p, placed, style)) or (
+        bool(placed) and page_path.is_file() and PREVIEWS_HEADING not in page_path.read_text(encoding="utf-8"))
 
     def run() -> dict:
         # Read the documents again: run_step hashed the inputs just before, so what the page shows is
         # at least as new as the hash that approve compares.
         plan = _plan(p)
+        _draw_stills(p, plan)
         _Media(p, plan.video).fill(plan)
         written = _write(p, _html(plan), _markdown(plan))
         return _result(plan, *written)
 
-    done = run_step(p, "storyboard", inputs, [page_path, md_path], run, force=force)
+    done = run_step(p, "storyboard", inputs, [page_path, md_path], run, force=force or unmade)
     if done["skipped"]:
         done = {**_result(_plan(p), page_path, md_path), "skipped": True}
     return done
