@@ -508,7 +508,7 @@ def test_sentence_row_shows_caption_lines_tag_and_weight(edited_project):
     write_json(p, "edit.json", edit)
     html = page(p)
     s01, s02 = sentence_row(html, "s01"), sentence_row(html, "s02")
-    assert "第一步是把停頓剪掉　讓節奏變快" in s02  # a comma inside a line is a wide space; the full stop goes
+    assert "第一步是把停頓剪掉 / 讓節奏變快" in s02  # the comma ends a caption; the full stop goes
     assert "steps" in s02 and "次要" in s02
     assert "claim" in s01 and "主要" in s01
 
@@ -560,7 +560,7 @@ def test_md_escapes_a_pipe_in_a_caption(tmp_path):
     p = edited_project_from_script(tmp_path, "我們用 a|b 來測試。")
     md = Path(validated_storyboard(p)["md"]).read_text(encoding="utf-8")
     (row,) = table_rows(md, "s01")
-    assert len(cells(row)) == 5 and "a\\|b" in row
+    assert len(cells(row)) == 7 and "a\\|b" in row
 
 
 # ---- warnings and the summary -----------------------------------------------------------------
@@ -858,7 +858,7 @@ def test_md_lists_match_the_page_numbers(edited_project):
     assert section(md, "要你決定")[1:] == ["   - 字幕：這個方法可以省下 150 分鐘",
                                          "   - 腳本：這個方法可以省下 150 分鐘。"]
     assert section(md, "其他要聽的地方")[0].startswith("2. ")
-    order = ["- 原長：", "- 新長：", "- 剪掉：", "- 要你決定：", "- 其他要聽：", "## 要你決定", "## 其他要聽的地方",
+    order = ["- 原長：", "- 新長：", "- 剪掉：", "- 推近：", "- 動畫：", "- 要你決定：", "- 其他要聽：", "## 要你決定", "## 其他要聽的地方",
              "## 句子", "## 剪輯候選"]
     positions = [md.index(mark) for mark in order]
     assert positions == sorted(positions)
@@ -893,7 +893,7 @@ def test_result_counts_decisions_and_listen_points(edited_project):
     html = Path(result["html"]).read_text(encoding="utf-8")
     md = Path(result["md"]).read_text(encoding="utf-8")
     assert (result["decisions"], result["listen_points"]) == (1, 3)
-    assert re.findall(r"<dt>(.*?)</dt>", html) == ["原長", "新長", "剪掉", "要你決定", "其他要聽"]
+    assert re.findall(r"<dt>(.*?)</dt>", html) == ["原長", "新長", "剪掉", "推近", "動畫", "要你決定", "其他要聽"]
     assert "<dt>要你決定</dt><dd>1 項</dd>" in html and "<dt>其他要聽</dt><dd>3 處</dd>" in html
     assert "- 要你決定：1 項" in md and "- 其他要聽：3 處" in md
     assert "請聽" not in html + md
@@ -1689,10 +1689,10 @@ def test_md_has_the_columns_and_one_row_per_sentence_and_trim(edited_project):
     write_json(p, "trim.json", trims)
     result = validated_storyboard(p)
     md = Path(result["md"]).read_text(encoding="utf-8")
-    assert "| 列 | 新時間 | 字幕 | 語意 | 標記 |" in md
+    assert "| 列 | 新時間 | 字幕 | 語意 | 推近 | 動畫 | 標記 |" in md
     assert "| 編號 | 種類 | 原因 | 辨識文字 | 處理 | 標記 |" in md
     assert len(table_rows(md, "s")) == 4 and len(table_rows(md, "t")) == 5
-    assert all(len(cells(row)) == 5 for row in table_rows(md, "s"))
+    assert all(len(cells(row)) == 7 for row in table_rows(md, "s"))
     (s04,) = table_rows(md, "s04")
     assert "最後記得追蹤我" in s04 and "claim" in s04
     (t05,) = table_rows(md, "t05")
@@ -1712,3 +1712,161 @@ def test_md_marks_unspoken_and_removed_sentences(tmp_path):
     (s03,) = table_rows(md, "s03")
     assert "沒講到" in s02 and "請聽" not in s02
     assert "移除" in s03 and "off topic" in s03 and "~~第三句話。~~" in s03
+
+
+# ---- animation cards ------------------------------------------------------------------------------
+
+
+def animation(html: str, md: str, sid: str) -> tuple[str, str]:
+    """The 動畫 cell of sentence `sid` on the page and in storyboard.md."""
+    (row,) = table_rows(md, sid)
+    return cell(sentence_row(html, sid), "動畫"), cells(row)[5].strip()
+
+
+def with_scenes(p, *items: dict) -> None:
+    edit = read_json(p, "edit.json")
+    edit["scenes"] = list(items)
+    write_json(p, "edit.json", edit)
+
+
+def made_up_scene(sid: str, card: str = "number-slab", params: dict | None = None, until: dict | None = None,
+                  scene_id: str = "sc1") -> dict:
+    return {"id": scene_id, "card": card, "at": {"s": sid, "char": 0}, "until": until or {"s": sid, "end": True},
+            "params": params if params is not None else {"value": "兩小時", "label": "一天多撐"}}
+
+
+def test_without_scenes_the_animation_column_is_empty_and_the_summary_counts_none(edited_project):
+    result = validated_storyboard(edited_project)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    for sid in ("s01", "s02", "s03", "s04"):
+        assert animation(html, md, sid) == ("", ""), sid
+    assert "<dt>動畫</dt><dd>0 段</dd>" in html and "- 動畫：0 段" in md
+
+
+def test_a_scene_shows_in_the_sentence_it_starts_in_with_its_card_its_texts_and_its_time_in_the_reel(
+        edited_project):
+    """The time is where the scene is in the reel, from its first frame to the frame after its last."""
+    from pipeline.scenes import scene_spans
+    from pipeline.storyboard import clock
+
+    p = edited_project
+    with_scenes(p, made_up_scene("s03", until={"s": "s04", "char": 1}),
+                made_up_scene("s01", "keyword-pop", {"text": "省電"}, scene_id="sc2"))
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    spans = scene_spans(read_json(p, "edit.json"), read_json(p, "transcript.json"), read_json(p, "trim.json"))
+    first, second = (f"{clock(item.start / 30)} 到 {clock((item.start + item.frames) / 30)}" for item in spans)
+    assert animation(html, md, "s03") == (f"數字卡：兩小時／一天多撐（{first}）",) * 2
+    assert animation(html, md, "s01") == (f"重點字：省電（{second}）",) * 2
+    assert animation(html, md, "s02") == ("", "") and animation(html, md, "s04") == ("", "")
+    assert "<dt>動畫</dt><dd>2 段</dd>" in html and "- 動畫：2 段" in md
+
+
+def test_a_scene_that_does_not_show_is_a_warning_in_chinese_and_its_code_is_in_the_result(edited_project):
+    p = edited_project
+    with_scenes(p, made_up_scene("s01", "keyword-pop", {"text": "省電"}))
+    remove_range(p, "s01", "s01")
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert result["warnings"][-1] == "scenes[0]: s01 is removed by cuts.extra, so it is not shown"
+    text = "動畫「重點字：省電」所在的句子整段移除了，這段動畫不會出現。"
+    assert f"<li>{text}</li>" in html and f"- 警告：{text}" in md
+    assert "scenes[0]" not in html + md and "<dt>動畫</dt><dd>0 段</dd>" in html
+    assert animation(html, md, "s01") == ("", "")
+
+
+def test_the_warnings_of_the_scenes_say_why_each_does_not_show_or_is_short(edited_project, monkeypatch):
+    from pipeline.scenes import Layout
+
+    scene = made_up_scene("s02")
+    monkeypatch.setattr("pipeline.storyboard.scene_layout", lambda edit, transcript, trims: [
+        Layout(0, scene, "s02", 3.0, 4.0, 0, 0), Layout(1, scene, None, 3.0, 4.0, 90, 0),
+        Layout(2, scene, None, 3.0, 4.0, 90, 18), Layout(3, scene, None, 3.0, 4.0, 90, 30)])
+    result = validated_storyboard(edited_project)
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert [line for line in md.splitlines() if line.startswith("- 警告：動畫")] == [
+        "- 警告：動畫「數字卡：兩小時／一天多撐」所在的句子整段移除了，這段動畫不會出現。",
+        "- 警告：動畫「數字卡：兩小時／一天多撐」的時間都被剪掉了，這段動畫不會出現。",
+        "- 警告：動畫「數字卡：兩小時／一天多撐」剪完只剩 0.6 秒，不到 1 秒。",
+    ]
+    assert "- 動畫：2 段" in md
+
+
+# ---- punch-in -------------------------------------------------------------------------------------
+
+
+def framing(html: str, md: str, sid: str) -> tuple[str, str]:
+    """The 推近 cell of sentence `sid` on the page and in storyboard.md."""
+    (row,) = table_rows(md, sid)
+    return cell(sentence_row(html, sid), "推近"), cells(row)[4].strip()
+
+
+def test_without_punch_in_the_framing_column_is_empty(edited_project):
+    """The Meijia reel cuts between every two sentences, but nothing is punched in unless edit.json punch_in says
+    so: every 推近 cell is empty."""
+    result = validated_storyboard(edited_project)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    for sid in ("s01", "s02", "s03", "s04"):
+        assert framing(html, md, sid) == ("", ""), sid
+
+
+def test_a_sentence_punch_in_sets_shows_where_its_shot_is_in_the_reel_and_its_scale(edited_project):
+    """The shot that starts in s03 runs from 0:07.1 to the next cut point, 0:10.5; the other sentences stay at the
+    base framing."""
+    p = edited_project
+    edit = read_json(p, "edit.json")
+    edit["punch_in"] = {"s03": 1.2}
+    write_json(p, "edit.json", edit)
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert framing(html, md, "s03") == ("0:07.1 到 0:10.5 放大 1.2 倍", "0:07.1 到 0:10.5 放大 1.2 倍")
+    for sid in ("s01", "s02", "s04"):
+        assert framing(html, md, sid) == ("", ""), sid
+
+
+def test_a_removed_sentence_has_no_framing_even_with_punch_in(edited_project):
+    p = edited_project
+    edit = read_json(p, "edit.json")
+    edit["punch_in"] = {"s01": 1.1}
+    write_json(p, "edit.json", edit)
+    remove_range(p, "s01", "s01")
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert framing(html, md, "s01") == ("", "")
+    assert framing(html, md, "s02") == ("", "")
+
+
+def test_the_punched_in_shots_that_start_in_one_sentence_are_listed_in_order(edited_project, monkeypatch):
+    """A shot that starts in the middle of a sentence is given its own span in the reel (the source 8.0 s is
+    2.37 s into the segment that starts at 5.63 s, 0:02.8 of the reel). The scale is shown as edit.json has it."""
+    monkeypatch.setattr("pipeline.storyboard.framings", lambda edit, transcript, trims: {
+        "s02": [(5.633333333333334, 7.0, 1.1234567), (8.0, 9.0, 1.1)]})
+    result = validated_storyboard(edited_project)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    text = "0:02.8 到 0:04.2 放大 1.1234567 倍、0:05.2 到 0:06.2 放大 1.1 倍"
+    assert framing(html, md, "s02") == (text, text)
+    assert framing(html, md, "s01") == ("", "")
+
+
+def test_the_summary_counts_the_cut_points_and_the_punched_in_shots(edited_project):
+    p = edited_project
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert "<dt>推近</dt><dd>剪接點 3 個，放大 0 段</dd>" in html
+    assert "- 推近：剪接點 3 個，放大 0 段" in md
+    edit = read_json(p, "edit.json")
+    edit["punch_in"] = {"s02": 1.1, "s04": 1.2}
+    write_json(p, "edit.json", edit)
+    result = validated_storyboard(p)
+    html = Path(result["html"]).read_text(encoding="utf-8")
+    md = Path(result["md"]).read_text(encoding="utf-8")
+    assert "<dt>推近</dt><dd>剪接點 3 個，放大 2 段</dd>" in html
+    assert "- 推近：剪接點 3 個，放大 2 段" in md

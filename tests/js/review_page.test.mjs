@@ -45,7 +45,7 @@ function pageData() {
   return {
     project: "2026-11-14-demo", version: "v1", mode: "line",
     source_s: 10, source_clock: "0:10.0", duration_s: 10, duration_clock: "0:10.0",
-    segments: [[0, 10]], captions: [], caption_style: STYLE,
+    segments: [[0, 10]], shots: [[0, 10, 1, 0.5, 0.5]], scenes: [], captions: [], caption_style: STYLE,
     sentences: [
       sentence("s01", "0:00.0", 0, "今天來聊三個小技巧。"),
       sentence("s02", "0:02.5", 2.5, "第一是把亮度調低。"),
@@ -607,5 +607,101 @@ describe("the player's clock never reads past the length it is shown with", () =
     video.currentTime = 5;
     video.dispatchEvent(new FakeEvent("timeupdate"));
     assert.equal($("clock").textContent, "0:05.0 / 0:12.3");
+  });
+});
+
+// ---- the punch-in ---------------------------------------------------------------------------------------------
+
+describe("the player shows the punch-in of the shot that plays", () => {
+  test("a punched-in shot scales the video about its anchor; a shot at the base framing leaves it as it is", async () => {
+    const server = new FakeServer();
+    Object.assign(server.data, {
+      segments: [[0, 4], [5, 10]], shots: [[0, 4, 1, 0.5, 0.5], [5, 10, 1.1, 0.2, 0.43]],
+      duration_s: 9, duration_clock: "0:09.0",
+    });
+    await openPage(server);
+    const video = $("video");
+    video.currentTime = 6;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(video.style.transform, "scale(1.1)");
+    assert.equal(video.style.transformOrigin, "20% 43%");
+    video.currentTime = 1;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(video.style.transform, "");
+    assert.equal(video.style.transformOrigin, "");
+  });
+
+  test("past the end of the reel the video keeps the framing of the last shot", async () => {
+    const server = new FakeServer();
+    Object.assign(server.data, {
+      segments: [[0, 4], [5, 10]], shots: [[0, 4, 1, 0.5, 0.5], [5, 10, 1.1, 0.2, 0.43]],
+      duration_s: 9, duration_clock: "0:09.0",
+    });
+    await openPage(server);
+    const video = $("video");
+    video.currentTime = 1;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(video.style.transform, "");
+    video.currentTime = 11;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(video.style.transform, "scale(1.1)");
+    assert.equal(video.style.transformOrigin, "20% 43%");
+  });
+
+  test("a reload that changes the shots frames the paused video anew", async () => {
+    const server = new FakeServer();
+    Object.assign(server.data, {
+      segments: [[0, 4], [5, 10]], shots: [[0, 4, 1, 0.5, 0.5], [5, 10, 1.1, 0.2, 0.43]],
+      duration_s: 9, duration_clock: "0:09.0",
+    });
+    await openPage(server);
+    const video = $("video");
+    video.currentTime = 6;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(video.style.transform, "scale(1.1)");
+    server.claude((s) => { s.data.shots = [[0, 4, 1.1, 0.5, 0.5], [5, 10, 1, 0.2, 0.43]]; });
+    await poll();
+    assert.equal(notice().textContent, UPDATED_TEXT);
+    assert.equal(video.style.transform, "");
+    assert.equal(video.style.transformOrigin, "");
+  });
+});
+
+// ---- the animation cards --------------------------------------------------------------------------------------
+
+describe("the player shows the label of the animation that plays", () => {
+  const LABEL = "動畫：數字卡　兩小時／一天多撐";
+
+  test("the label is over the video while its scene plays, and gone before and after", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL }];
+    await openPage(server);
+    const video = $("video");
+    const label = $("scene");
+    video.currentTime = 1;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(label.hidden, true);
+    video.currentTime = 3;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(label.hidden, false);
+    assert.equal(label.textContent, LABEL);
+    video.currentTime = 4.5;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal(label.hidden, true);
+    assert.equal(label.textContent, "");
+  });
+
+  test("a reload that takes the scene away hides its label on the paused video", async () => {
+    const server = new FakeServer();
+    server.data.scenes = [{ start: 2.5, end: 4.5, label: LABEL }];
+    await openPage(server);
+    const video = $("video");
+    video.currentTime = 3;
+    video.dispatchEvent(new FakeEvent("timeupdate"));
+    assert.equal($("scene").hidden, false);
+    server.claude((s) => { s.data.scenes = []; });
+    await poll();
+    assert.equal(notice().textContent, UPDATED_TEXT);
+    assert.equal($("scene").hidden, true);
   });
 });

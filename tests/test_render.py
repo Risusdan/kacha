@@ -7,6 +7,7 @@ the output came from. Tests that need another kind of source build it with helpe
 
 import json
 import math
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,7 @@ from helpers import (
     approve_project,
     approved_project_in,
     corner_luma,
+    event,
     force_gate1_open,
     gray_index,
     loudness,
@@ -34,19 +36,21 @@ from helpers import (
 )
 from media_fixtures import make_clip
 
-from pipeline import words
-from pipeline.captions import write_ass
+from pipeline import punch, words
+from pipeline.captions import caption_top_px, write_ass
 from pipeline.cli import main
 from pipeline.edit import Segment
 from pipeline.errors import PipelineError
 from pipeline.media import ffmpeg_bin, ffprobe_bin, ffprobe_json, probe, run_ffmpeg
 from pipeline.prep import prep
-from pipeline.project import gate_ok, load_state, next_step, save_state, step_done
+from pipeline.punch import Shot, base_window, window
+from pipeline.project import Project, gate_ok, load_state, next_step, save_state, step_done
 from pipeline.render import (
     AUDIO_BITRATE,
     LENGTH_TOLERANCE_S,
     PREVIEW_MAX_BYTES,
     PREVIEW_OVER,
+    _balanced_sum,
     _ffmpeg_rate,
     build_ffmpeg_args,
     build_preview_args,
@@ -58,7 +62,10 @@ from pipeline.render import (
     render,
     select_expr,
     video_bitrate,
+    zoom_exprs,
 )
+from pipeline.scene_render import render_scenes
+from pipeline.scenes import Placed
 from pipeline.style import load_style, styles_root
 
 FPS = 30
@@ -304,25 +311,81 @@ def test_select_expr_is_exact_where_a_frame_time_is_a_six_place_number(tmp_path)
     assert pick_frames(tmp_path, clip, [Segment(a / FPS, b / FPS) for a, b in pieces]) == wanted
 
 
+BASE = (0, 0, 1080, 1920)  # the base window of a 1080x1920 picture: all of it
+
+
+def flat(segments: list[Segment]) -> list[Shot]:
+    """`segments` as shots of the base framing: scale 1, anchored at the centre."""
+    return [Shot(s.start, s.end, "s01", 1.0, 0.5, 0.5) for s in segments]
+
+
 GRAPH = (
     "[0:v]setpts=PTS-STARTPTS,fps=30,select='gte(pts,0)*lt(pts,30)',setpts=N/30/TB,"
-    "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+    "crop=1080:1920:0:0,zoompan=z='1':x='0':y='0':d=1:s=1080x1920:fps=30,"
     "subtitles=filename=captions.ass:fontsdir=fonts,format=yuv420p[v]"
 )
+
+# Frames 15-44 of the source at the base framing, then frames 60-104 punched in to 1.2 about (0.25, 0.5).
+TWO_SHOTS = [Shot(0.51, 1.49, "s01", 1.0, 0.25, 0.5), Shot(2.0, 3.5, "s02", 1.2, 0.25, 0.5)]
+
+
+def test_zoom_exprs_hold_each_punched_in_shot_over_its_frames_of_the_reel():
+    """The second shot is frames 30-74 of the reel (the first is 30 frames: 15 to 45, as select counts them). At 1.2
+    about (0.25, 0.5) of a 1080x1920 base window it shows the 900x1600 part from x 45, which is odd: 44 (an even
+    pixel, as yuv420 has one chroma sample per 2x2 pixels), and y 160."""
+    assert zoom_exprs(TWO_SHOTS, BASE) == (
+        "1+gte(on,30)*lt(on,75)*0.2", "gte(on,30)*lt(on,75)*44", "gte(on,30)*lt(on,75)*160")
+
+
+def test_zoom_exprs_of_the_base_framing_alone_are_constants():
+    assert zoom_exprs(flat([Segment(0, 1), Segment(2, 3)]), BASE) == ("1", "0", "0")
+
+
+def test_zoom_exprs_place_the_window_in_pixels_of_the_base_window():
+    # a 1920x1080 picture: the base window is 606x1080; x 0.25 * (1 - 1/1.2) * 606 = 25.25 -> 26, y 90
+    assert zoom_exprs(TWO_SHOTS, (656, 0, 606, 1080)) == (
+        "1+gte(on,30)*lt(on,75)*0.2", "gte(on,30)*lt(on,75)*26", "gte(on,30)*lt(on,75)*90")
+
+
+def test_zoom_exprs_add_their_terms_up_as_a_balanced_tree():
+    """Like select's, a sum of many terms is a balanced tree: ffmpeg cannot parse a chain of 100 terms or more.
+    200 two-frame shots, every second one at 1.1 about the centre (x 0.5 * (1 - 1/1.1) * 1080 = 49.09, whose nearest
+    even pixel is 50; y 87.27 -> 88)."""
+    shots = [Shot(3 * i / FPS, (3 * i + 2) / FPS, "s01", 1.1 if i % 2 else 1.0, 0.5, 0.5) for i in range(200)]
+    spans = [f"gte(on,{2 * i})*lt(on,{2 * i + 2})" for i in range(1, 200, 2)]
+    assert zoom_exprs(shots, BASE) == (
+        "1+" + _balanced_sum([f"{span}*0.1" for span in spans]),
+        _balanced_sum([f"{span}*50" for span in spans]),
+        _balanced_sum([f"{span}*88" for span in spans]),
+    )
+
+
+def test_the_graph_crops_the_base_window_and_zooms_each_shot(tmp_path):
+    fs = tmp_path / "f.txt"
+    build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), TWO_SHOTS, (656, 0, 606, 1080), tmp_path / "o.mp4", fs)
+    assert fs.read_text() == (
+        "[0:v]setpts=PTS-STARTPTS,fps=30,select='gte(pts,15)*lt(pts,45)+gte(pts,60)*lt(pts,105)',setpts=N/30/TB,"
+        "crop=606:1080:656:0,"
+        "zoompan=z='1+gte(on,30)*lt(on,75)*0.2':x='gte(on,30)*lt(on,75)*26':y='gte(on,30)*lt(on,75)*90'"
+        ":d=1:s=1080x1920:fps=30,"
+        "subtitles=filename=captions.ass:fontsdir=fonts,format=yuv420p[v]"
+    )
 
 
 def test_args_pin_output_spec(tmp_path):
     fs = tmp_path / "f.txt"
-    args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 1)], tmp_path / "o.mp4", fs)
+    args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 1)]), BASE, tmp_path / "o.mp4", fs)
     for want in ("h264_videotoolbox", "12000k", "192k", "48000", "aac", "+faststart"):
         assert want in args
     graph = fs.read_text()
-    assert graph.count("scale=") == 1 and "fps=30" in graph and "fontsdir=fonts" in graph
+    # every frame is scaled once, by zoompan, from the base window to 1080x1920
+    assert "scale" not in graph and graph.count("zoompan=") == 1 and ":s=1080x1920:" in graph
+    assert "fps=30" in graph and "fontsdir=fonts" in graph
 
 
 def test_args_and_graph_are_exactly_the_specified_ones(tmp_path):
     fs = tmp_path / "f.txt"
-    args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 1)], tmp_path / "o.mp4", fs)
+    args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 1)]), BASE, tmp_path / "o.mp4", fs)
     assert fs.read_text().strip() == GRAPH
     assert args == [
         "-hide_banner", "-loglevel", "verbose", "-y", "-i", "/v.mov", "-i", "/c.wav",
@@ -337,9 +400,32 @@ def test_the_graph_has_no_path_in_it(tmp_path):
     """Only relative names go into the graph, so a studio path with a space or a quote cannot break it."""
     fs = tmp_path / "my st'udio" / "f.txt"
     fs.parent.mkdir()
-    build_ffmpeg_args(Path("/in box/it's.mov"), Path("/c.wav"), [Segment(0, 1)], tmp_path / "o.mp4", fs)
+    build_ffmpeg_args(Path("/in box/it's.mov"), Path("/c.wav"), flat([Segment(0, 1)]), BASE, tmp_path / "o.mp4", fs,
+                      scenes=[(0, Path("/my sc'enes/a.mov"))])
     graph = fs.read_text()
-    assert not any(part in graph for part in ("in box", "it's", "c.wav", "o.mp4", "udio", str(tmp_path)))
+    assert not any(part in graph for part in ("in box", "it's", "c.wav", "o.mp4", "udio", "enes", "a.mov",
+                                              str(tmp_path)))
+
+
+def test_the_graph_overlays_each_scene_after_the_zoom_and_before_the_captions(tmp_path):
+    """Each clip is an input of its own, after the picture and the sound. It is moved to the reel frame its scene
+    starts at and overlaid on the zoomed picture, which shows as it is again when the clip ends; the captions are
+    burnt in last, over the cards."""
+    fs = tmp_path / "f.txt"
+    clips = [(30, Path("/w/scenes/a.mov")), (75, Path("/w/scenes/b.mov"))]
+    args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 4)]), BASE, tmp_path / "o.mp4", fs,
+                             scenes=clips)
+    assert fs.read_text() == (
+        "[0:v]setpts=PTS-STARTPTS,fps=30,select='gte(pts,0)*lt(pts,120)',setpts=N/30/TB,"
+        "crop=1080:1920:0:0,zoompan=z='1':x='0':y='0':d=1:s=1080x1920:fps=30[picture];"
+        "[2:v]setpts=PTS-STARTPTS+30/30/TB[scene0];[picture][scene0]overlay=eof_action=pass[with0];"
+        "[3:v]setpts=PTS-STARTPTS+75/30/TB[scene1];[with0][scene1]overlay=eof_action=pass[with1];"
+        "[with1]subtitles=filename=captions.ass:fontsdir=fonts,format=yuv420p[v]"
+    )
+    assert args[:args.index("-/filter_complex")] == [
+        "-hide_banner", "-loglevel", "verbose", "-y", "-i", "/v.mov", "-i", "/c.wav",
+        "-i", "/w/scenes/a.mov", "-i", "/w/scenes/b.mov"]
+    assert args[args.index("-map"):args.index("-map") + 4] == ["-map", "[v]", "-map", "1:a"]
 
 
 # ---- the video bitrate follows the reel length ------------------------------------------------
@@ -389,18 +475,18 @@ def test_video_bitrate_refuses_a_reel_that_needs_less_than_4_mbps(duration_s):
 
 def test_args_carry_the_bitrate_of_the_reel_length(tmp_path):
     fs, out = tmp_path / "f.txt", tmp_path / "o.mp4"
-    one_long = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 223.033)], out, fs)
+    one_long = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 223.033)]), BASE, out, fs)
     assert bitrate_arg(one_long) == f"{video_bitrate(223.033) // 1000}k"
     assert video_bitrate(223.033) < 12_000_000
     two_pieces = [Segment(10, 110), Segment(200, 323.033)]  # the lengths add up, not the time they span
-    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), two_pieces, out, fs)) == bitrate_arg(one_long)
-    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 1)], out, fs)) == "12000k"
+    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat(two_pieces), BASE, out, fs)) == bitrate_arg(one_long)
+    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 1)]), BASE, out, fs)) == "12000k"
 
 
 def test_args_of_a_reel_too_long_for_4_mbps_raise_before_the_filter_script_is_written(tmp_path):
     fs = tmp_path / "f.txt"
     with pytest.raises(PipelineError, match="612.0 s"):
-        build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 612.0)], tmp_path / "o.mp4", fs)
+        build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 612.0)]), BASE, tmp_path / "o.mp4", fs)
     assert not fs.exists()
 
 
@@ -415,7 +501,7 @@ def test_ffmpeg_rate_spelling():
 def test_no_segments_is_a_pipeline_error(tmp_path):
     fs = tmp_path / "f.txt"
     with pytest.raises(PipelineError) as e:
-        build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [], tmp_path / "o.mp4", fs)
+        build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [], BASE, tmp_path / "o.mp4", fs)
     assert e.value.message == "nothing to render: the reel has no segments"
     assert not fs.exists()
 
@@ -426,7 +512,7 @@ def test_exact_minimum_bitrate_is_accepted(tmp_path):
     is 3_993_000."""
     assert video_bitrate(543.8) == 4_000_000
     fs, out = tmp_path / "f.txt", tmp_path / "o.mp4"
-    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 543.8)], out, fs)) == "4000k"
+    assert bitrate_arg(build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 543.8)]), BASE, out, fs)) == "4000k"
     with pytest.raises(PipelineError, match="544.8 s") as e:
         video_bitrate(544.8)
     assert "4 Mbps" in e.value.message
@@ -725,22 +811,23 @@ def test_render_draws_every_caption_at_the_fixed_top_of_the_style(approved_proje
     assert dialogues and all("{\\an8\\pos(540,1158)}" in line for line in dialogues)
 
 
-def test_render_does_not_read_faces_json(approved_project):
+def test_render_reads_faces_json(approved_project):
     p = approved_project
     (p.work / "faces.json").write_text("not json", encoding="utf-8")
-    result = render(p)
-    assert result["skipped"] is False and Path(result["out"]).is_file()
+    with pytest.raises(PipelineError, match="faces.json"):
+        render(p)
+    assert not (p.out / "final.mp4").exists()
 
 
-def test_render_does_not_list_faces_json_as_an_input(approved_project):
+def test_render_lists_faces_json_as_an_input(approved_project):
     p = approved_project
     render(p)
     assert set(load_state(p)["steps"]["render"]["inputs"]) == {
-        "edit", "transcript", "trim", "style", "audio", "video", "probe", "words", "dictionary"
+        "edit", "transcript", "trim", "style", "audio", "video", "probe", "faces", "words", "dictionary"
     }
 
 
-def test_changing_faces_json_does_not_make_the_render_run_again(approved_project):
+def test_changing_faces_json_makes_the_render_run_again(approved_project):
     p = approved_project
     render(p)
     faces = json.loads((p.work / "faces.json").read_text(encoding="utf-8"))
@@ -748,7 +835,46 @@ def test_changing_faces_json_does_not_make_the_render_run_again(approved_project
     (p.work / "faces.json").write_text(json.dumps(faces), encoding="utf-8")
     calls = []
     again = render(p, runner=recording(calls))
-    assert again["skipped"] is True and calls == []
+    assert again["skipped"] is False and calls
+
+
+def face_at(cx: float, cy: float) -> dict:
+    return {"t": 1.0, "x0": cx - 0.1, "y0": cy - 0.1, "x1": cx + 0.1, "y1": cy + 0.1, "score": 0.9}
+
+
+def test_render_frames_every_shot_of_the_edit_about_the_face(approved_project, monkeypatch):
+    """The graph holds the shots of punch.shots for the edit and faces.json, in pixels of the base window of the
+    picture the render reads."""
+    p = approved_project
+    (p.work / "faces.json").write_text(json.dumps({"boxes": [face_at(0.2, 0.3)]}), encoding="utf-8")
+    edit = json.loads(p.edit_path.read_text(encoding="utf-8"))
+    edit["punch_in"] = {edit["sentences"][-1]["id"]: 1.2}  # nothing is punched in without it
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    force_gate1_open(p)
+    monkeypatch.setattr("pipeline.render.check_output", lambda path, seconds: [])
+    render(p, runner=stand_in_encoder([]))
+    edit, transcript, trims = (json.loads((p.work / name).read_text(encoding="utf-8"))
+                               for name in ("edit.json", "transcript.json", "trim.json"))
+    shots = punch.shots(edit, transcript, trims, {"boxes": [face_at(0.2, 0.3)]}, {"display_w": 1080, "display_h": 1920})
+    assert any(shot.scale > 1 for shot in shots)  # else the test would show nothing
+    z, x, y = zoom_exprs(shots, BASE)
+    assert x != "0" and y != "0"
+    graph = (p.work / "render" / "filter.txt").read_text(encoding="utf-8")
+    assert f"crop=1080:1920:0:0,zoompan=z='{z}':x='{x}':y='{y}':d=1:" in graph
+
+
+def test_render_frames_the_picture_it_reads_not_the_size_probe_json_gives(approved_project, monkeypatch):
+    """probe.json gives the size of the source; for an HDR source the render reads prep's smaller SDR copy. The base
+    window is of the picture the render reads: here probe.json says 2160x3840 and the video is 1080x1920."""
+    p = approved_project
+    path = p.work / "probe.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert (doc["display_w"], doc["display_h"]) == (1080, 1920)
+    path.write_text(json.dumps({**doc, "display_w": 2160, "display_h": 3840}), encoding="utf-8")
+    force_gate1_open(p)
+    monkeypatch.setattr("pipeline.render.check_output", lambda path, seconds: [])
+    render(p, runner=stand_in_encoder([]))
+    assert ",crop=1080:1920:0:0,zoompan=" in (p.work / "render" / "filter.txt").read_text(encoding="utf-8")
 
 
 FONT_LINE = "[Parsed_subtitles_0] fontselect: (Noto Sans TC, 700, 0) -> NotoSansTC-Bold, 0, NotoSansTC-Bold\n"
@@ -1115,22 +1241,25 @@ def test_render_of_an_hdr_video_that_starts_late_is_frame_accurate_and_in_sync(t
 # ---- other kinds of source, through the graph alone -------------------------------------------
 
 
-def render_segments(tmp_path: Path, clip: Path, segments: list[Segment]) -> Path:
-    """The `segments` of `clip` through build_ffmpeg_args and ffmpeg (the filter graph read from its file), with no
-    captions."""
+def render_segments(tmp_path: Path, clip: Path, shots: list[Shot], base: tuple[int, int, int, int] = BASE, *,
+                    events: list = (), scenes: list[tuple[int, Path]] = ()) -> Path:
+    """The `shots` of `clip`, whose base window is `base`, through build_ffmpeg_args and ffmpeg (the filter graph read
+    from its file), with the caption `events` (none by default) at the caption top of the default style, and the
+    clips of `scenes` (reel start frame, clip) overlaid."""
     work = tmp_path / "work"
     (work / "fonts").mkdir(parents=True)
     style = load_style()
     for weight in ("regular", "bold"):
         font = static_font(weight)
         shutil.copyfile(font, work / "fonts" / font.name)
-    write_ass([], style, 1040, "line", work / "captions.ass")
+    write_ass(list(events), style, caption_top_px(style), "line", work / "captions.ass", font=static_font("bold"))
     full, wav = tmp_path / "full.wav", tmp_path / "cut.wav"
     run_ffmpeg(["-y", "-i", str(clip), "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(full)],
                tmp_path / "wav.log")
-    cut_audio(full, segments, wav)
+    cut_audio(full, [Segment(s.start, s.end) for s in shots], wav)
     out = tmp_path / "out.mp4"
-    run_ffmpeg(build_ffmpeg_args(clip, wav, segments, out, work / "filter.txt"), work / "render.log", cwd=work)
+    run_ffmpeg(build_ffmpeg_args(clip, wav, shots, base, out, work / "filter.txt", scenes=scenes),
+               work / "render.log", cwd=work)
     return out
 
 
@@ -1147,26 +1276,146 @@ def test_graph_turns_a_rotated_source_upright_before_it_scales(tmp_path):
     """A 1920x1080 file marked rotated by 90 degrees shows as 1080x1920. ffmpeg turns it upright on its own,
     and the scale and the crop that follow count on that."""
     clip = make_clip(tmp_path / "src", w=1920, h=1080, rotate=90, seconds=2)
-    out = render_segments(tmp_path, clip, [Segment(0, 1)])
+    out = render_segments(tmp_path, clip, flat([Segment(0, 1)]))
     assert check_output(out, 1.0) == []
     upright, rendered = raw_gray_frame(clip, 10), raw_gray_frame(out, 10)  # clip is decoded upright, 1080x1920
     assert upright.size == rendered.size == 1080 * 1920
     assert np.abs(upright - rendered).mean() < 2  # only encoder noise apart
 
 
+def pattern_clip(dest: Path, w: int, h: int, seconds: float) -> tuple[Path, np.ndarray]:
+    """A still picture `w` x `h` whose gray changes with x and with y and repeats nowhere (a ramp and a wave of odd
+    periods), with a tone: which part of it a frame shows can be told by comparing. Returns the clip and the
+    picture."""
+    ys, xs = np.mgrid[0:h, 0:w]
+    wave = np.sin(2 * np.pi * xs / 197) * np.cos(2 * np.pi * ys / 311)
+    picture = np.clip(70 + 0.04 * xs + 0.03 * ys + 60 * wave, 0, 255).astype(np.uint8)
+    dest.mkdir(parents=True)
+    still = dest / "picture.gray"
+    still.write_bytes(picture.tobytes())
+    clip = dest / "pattern.mp4"
+    run_ffmpeg(["-y", "-stream_loop", "-1", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{w}x{h}", "-framerate", "30",
+                "-i", str(still), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", str(seconds),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "8", "-pix_fmt", "yuv420p", "-c:a", "aac", str(clip)],
+               dest / "pattern.log")
+    return clip, picture.astype(float)
+
+
+def part_of(picture: np.ndarray, base: tuple[int, int, int, int], left: int, top: int, scale: float) -> np.ndarray:
+    """What a 1080x1920 frame shows of `picture` when zoompan takes, from the base window `base`, the part `scale`
+    times smaller (its size truncated, as zoompan does) whose top-left is (`left`, `top`): the nearest pixel to the
+    centre of each output pixel."""
+    bx, by, bw, bh = base
+    w, h = int(bw / scale), int(bh / scale)
+    xs = bx + left + np.clip(np.round((np.arange(1080) + 0.5) * w / 1080 - 0.5), 0, w - 1).astype(int)
+    ys = by + top + np.clip(np.round((np.arange(1920) + 0.5) * h / 1920 - 0.5), 0, h - 1).astype(int)
+    return picture[np.ix_(ys, xs)]
+
+
+@pytest.mark.parametrize("w, h", [(1080, 1920), (1920, 1080)])
+def test_a_punched_in_shot_shows_the_part_about_its_anchor_and_the_others_the_base_window(tmp_path, w, h):
+    """Frames 0-29 of the reel are a shot at the base framing, frames 30-74 one punched in to 1.2 about (0.3, 0.4).
+    Each frame shows the part of the picture it should and not the other; the frame count is the one select keeps.
+    The 1920x1080 picture is cropped to its centre 9:16 first, and that window is enlarged. Measured: a frame is
+    about 0.6 gray levels from its part on average, about 2.1 from a part two pixels off and over 30 from the
+    other."""
+    clip, picture = pattern_clip(tmp_path / "src", w, h, 4)
+    base = base_window(w, h)
+    shots = [Shot(0.0, 1.0, "s01", 1.0, 0.3, 0.4), Shot(2.0, 3.5, "s02", 1.2, 0.3, 0.4)]
+    out = render_segments(tmp_path, clip, shots, base)
+    assert check_output(out, 2.5) == []
+    assert len(corner_luma(out)) == 75
+    left, top, _, _ = window((0.3, 0.4), 1.2)
+    whole = part_of(picture, base, 0, 0, 1.0)
+    punched = part_of(picture, base, round(left * base[2] / 2) * 2, round(top * base[3] / 2) * 2, 1.2)
+    for k, wanted, other in ((0, whole, punched), (29, whole, punched), (30, punched, whole), (74, punched, whole)):
+        frame = raw_gray_frame(out, k).reshape(1920, 1080)
+        assert np.abs(frame - wanted).mean() < 1.5, k
+        assert np.abs(frame - other).mean() > 15, k
+
+
+def rgb_frames(video: Path, frames: list[int]) -> dict[int, np.ndarray]:
+    """Frames of `video` by number, as RGB (0 to 255, 1920 rows by 1080 columns) decoded as BT.709 limited range."""
+    picked = "+".join(f"eq(n\\,{k})" for k in frames)
+    done = subprocess.run(
+        [ffmpeg_bin(), "-nostdin", "-v", "error", "-i", str(video), "-vf",
+         f"select='{picked}',scale=in_color_matrix=bt709:in_range=limited,format=rgb24", "-fps_mode", "passthrough",
+         "-f", "rawvideo", "-"],
+        capture_output=True, check=True, timeout=120)
+    planes = np.frombuffer(done.stdout, dtype=np.uint8).reshape(len(frames), 1920, 1080, 3).astype(int)
+    return dict(zip(sorted(frames), planes))
+
+
+def tagged_bt709(clip: Path, dest: Path) -> Path:
+    """A copy of the H.264 `clip` marked BT.709 limited range, as phone footage is; the picture is not touched."""
+    run_ffmpeg(["-y", "-i", str(clip), "-c", "copy", "-bsf:v", "h264_metadata=colour_primaries=1"
+                ":transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0", str(dest)],
+               dest.with_suffix(".log"))
+    return dest
+
+
+def test_a_card_shows_over_the_picture_during_its_scene_only_and_the_captions_stay(tmp_path):
+    """A real keyword-pop clip of 40 frames (the first and the last of them empty) from reel frame 30, over a
+    4-second picture marked BT.709 with a caption all through it, against the same render without the scene.
+    Frames 0-30 and 69-119 are as they were in the zone; frames 31-68 differ there; outside the zone and the caption
+    band nothing changes beyond the noise of the encoder; the caption is drawn over the card frames as over the
+    others; the reel keeps its 120 frames; and the pill has the accent of the style. The zone is taken to the 2x2
+    blocks it touches, as yuv420 has one chroma sample per block: the pill on the zone's top row (269, odd) colours
+    row 268 too. Measured: 17 500 to 37 500 changed pixels in the zone while the card shows, none before or after;
+    at most 6 levels of difference outside the zone and the caption band, and 0.2 on average in the band; the pill
+    (254, 210, 0)."""
+    from test_scene_cards import requirements_or_skip  # skips without node, the modules, the browser or the fonts
+
+    requirements_or_skip()
+    style = load_style()
+    p = Project("2026-11-15-cards", tmp_path / "project")
+    p.work.mkdir(parents=True)
+    scene = {"id": "sc1", "card": "keyword-pop", "params": {"text": "省電"}, "at": {"s": "s01", "char": 0},
+             "until": {"s": "s01", "end": True}}
+    (_, clip), = render_scenes(p, [Placed(0, scene, 30, 40)], style)
+    picture = tagged_bt709(make_clip(tmp_path / "src", seconds=4, gray_counter=True), tmp_path / "picture.mp4")
+    shots, captions = flat([Segment(0, 4)]), [event("今天聊省電", 0.0, 4.0)]
+    plain = render_segments(tmp_path / "plain", picture, shots, events=captions)
+    carded = render_segments(tmp_path / "carded", picture, shots, events=captions, scenes=[(30, clip)])
+    assert len(corner_luma(carded)) == 120
+
+    shown, frames = range(31, 69), [0, 29, 30, 31, 32, 42, 50, 66, 67, 68, 69, 70, 119]
+    before, after = rgb_frames(plain, frames), rgb_frames(carded, frames)
+    zone = style["scenes"]["zone"]
+    inside = np.zeros((1920, 1080), dtype=bool)
+    inside[zone["y0"] // 2 * 2:-(-zone["y1"] // 2) * 2, zone["x0"] // 2 * 2:-(-zone["x1"] // 2) * 2] = True
+    band = np.zeros((1920, 1080), dtype=bool)
+    band[caption_top_px(style) - 40:style["captions"]["bottom_px"] + 40] = True
+    for k in frames:
+        diff = np.abs(after[k] - before[k]).max(axis=2)
+        changed = int((diff[inside] > 8).sum())
+        assert (changed > 10_000) if k in shown else (changed == 0), (k, changed)
+        assert diff[~inside & ~band].max() <= 12, k
+        text = int((np.abs(after[k][band] - after[k][0, 0]).max(axis=1) > 60).sum())
+        assert text > 5_000, (k, text)
+        assert np.abs(after[k][band] - before[k][band]).mean() <= 1.0, k
+    accent = np.array([int(style["scenes"]["colors"]["accent"][i:i + 2], 16) for i in (1, 3, 5)])
+    pill = after[50][inside & (np.abs(after[50] - accent).max(axis=2) <= 12)]
+    assert len(pill) > 20_000
+    assert np.abs(np.median(pill, axis=0) - accent).max() <= 4, np.median(pill, axis=0)
+
+
 def test_graph_makes_a_variable_frame_rate_source_constant(tmp_path):
     clip = make_clip(tmp_path / "src", seconds=2, vfr=True)
     assert probe(clip).is_vfr
-    out = render_segments(tmp_path, clip, [Segment(0, 1)])
+    out = render_segments(tmp_path, clip, flat([Segment(0, 1)]))
     assert check_output(out, 1.0) == []
     assert len(corner_luma(out)) == 30
 
 
 def test_graph_renders_a_reel_of_more_than_a_hundred_segments(tmp_path):
-    """The whole graph and encode, with the graph read from its file: 150 one-frame segments (a plain chain of
-    100 terms or more stops ffmpeg with "Cannot allocate memory")."""
+    """The whole graph and encode, with the graph read from its file: 150 one-frame segments, every second one
+    punched in, so select and zoompan's z, x and y each add up 75 terms or more (a plain chain of 100 terms or more
+    stops ffmpeg with "Cannot allocate memory"). The gray of a counter frame is the same all over, punched in or
+    not."""
     clip = make_clip(tmp_path / "src", seconds=10, gray_counter=True)
-    out = render_segments(tmp_path, clip, ones(150))
+    shots = [Shot(s.start, s.end, "s01", 1.1 if i % 2 else 1.0, 0.3, 0.6) for i, s in enumerate(ones(150))]
+    out = render_segments(tmp_path, clip, shots)
     assert check_output(out, 150 / FPS) == []
     assert [gray_index(out, k) for k in range(150)] == [2 * i % 50 for i in range(150)]
 
@@ -1176,7 +1425,7 @@ def test_a_forced_low_video_bitrate_gives_a_file_of_that_overall_bit_rate(tmp_pa
     (measured 4.27 Mbit/s overall: the target is held closely, which the size budget of video_bitrate relies on)."""
     monkeypatch.setattr("pipeline.render.video_bitrate", lambda duration_s: 4_000_000)
     clip = make_clip(tmp_path / "src", seconds=8)  # the testsrc2 pattern
-    out = render_segments(tmp_path, clip, [Segment(0, 8)])
+    out = render_segments(tmp_path, clip, flat([Segment(0, 8)]))
     assert check_output(out, 8.0) == []
     done = subprocess.run(
         [ffprobe_bin(), "-v", "error", "-show_entries", "format=bit_rate", "-of", "json", str(out)],
@@ -1262,7 +1511,7 @@ def test_preview_bitrate_is_a_whole_number_of_kbit_and_keeps_the_file_under_the_
 def test_preview_args_scale_to_540_by_960_with_aac_96k(tmp_path):
     final, out = tmp_path / "final.mp4", tmp_path / "preview.tmp.mp4"
     args = build_preview_args(final, out, 919_000)
-    final_args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), [Segment(0, 1)], tmp_path / "o.mp4",
+    final_args = build_ffmpeg_args(Path("/v.mov"), Path("/c.wav"), flat([Segment(0, 1)]), BASE, tmp_path / "o.mp4",
                                    tmp_path / "f.txt")
     assert args == [
         "-hide_banner", "-loglevel", "error", "-y", "-i", str(final), "-vf", "scale=540:960", "-r", "30",
@@ -1457,3 +1706,125 @@ def test_a_preview_that_ffmpeg_did_not_write_is_a_warning(approved_project, caps
     assert out["warnings"] == ["preview failed: preview was not written"]
     assert sorted(path.name for path in p.out.iterdir()) == ["final.mp4"]
     assert "preview" not in load_state(p)["steps"]
+
+
+# ---- the animation cards in the render -------------------------------------------------------------------------
+
+
+def with_scene(p, params: dict | None = None) -> Project:
+    """`p` with a keyword-pop scene over its first kept sentence, storyboard built and gate 1 approved again."""
+    edit = json.loads(p.edit_path.read_text(encoding="utf-8"))
+    first = edit["sentences"][0]["id"]
+    edit["scenes"] = [{"id": "sc1", "card": "keyword-pop", "params": params or {"text": "省電"},
+                       "at": {"s": first, "char": 0}, "until": {"s": first, "end": True}}]
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    return approve_project(p)
+
+
+def stand_in_cards(monkeypatch, folder: Path) -> list:
+    """Render the cards without Node: render's check_renderable lets everything through, and its render_scenes
+    notes what it was given (in the list returned) and gives a clip file of a few bytes in `folder` for each scene."""
+    calls = []
+
+    def render_scenes(p, placed, style, run=None):
+        calls.append(list(placed))
+        clips = []
+        for item in placed:
+            clip = folder / f"clip {item.index}.mov"
+            clip.write_bytes(b"a clip")
+            clips.append((item, clip))
+        return clips
+
+    monkeypatch.setattr("pipeline.render.check_renderable", lambda p, placed, style: None)
+    monkeypatch.setattr("pipeline.render.render_scenes", render_scenes)
+    return calls
+
+
+def scene_sources(folder: Path) -> set[str]:
+    """The input names render gives the files of the card sources in `folder`."""
+    files = [path for path in (folder / "src").rglob("*") if path.is_file()]
+    names = {f"scenes/{path.relative_to(folder).as_posix()}" for path in files}
+    return names | {"scenes/render.mjs", "scenes/package-lock.json"}
+
+
+def test_render_overlays_the_clip_of_each_scene_at_its_reel_frame(approved_project, monkeypatch, tmp_path,
+                                                                   no_output_check):
+    from pipeline.scenes import scene_spans
+
+    p = with_scene(approved_project)
+    scenes, calls = stand_in_cards(monkeypatch, tmp_path), []
+    render(p, runner=fake_encoder(calls))
+    edit, transcript, trims = (json.loads(path.read_text(encoding="utf-8"))
+                               for path in (p.edit_path, p.work / "transcript.json", p.work / "trim.json"))
+    placed = scene_spans(edit, transcript, trims)
+    assert len(placed) == 1 and scenes == [placed]
+    final, = finals_of(calls)
+    args = final["args"]
+    assert args[args.index("-/filter_complex") - 2:args.index("-/filter_complex")] == [
+        "-i", str(tmp_path / "clip 0.mov")]
+    graph = (p.work / "render" / "filter.txt").read_text(encoding="utf-8")
+    assert f"[2:v]setpts=PTS-STARTPTS+{placed[0].start}/30/TB[scene0]" in graph
+    assert graph.index("overlay=eof_action=pass") < graph.index("subtitles=")
+
+
+def test_render_lists_the_card_sources_as_inputs_when_there_are_scenes(approved_project, monkeypatch, tmp_path,
+                                                                        no_output_check):
+    from pipeline.scene_render import scenes_dir
+
+    p = with_scene(approved_project)
+    stand_in_cards(monkeypatch, tmp_path)
+    render(p, runner=fake_encoder([]))
+    assert set(load_state(p)["steps"]["render"]["inputs"]) == {
+        "edit", "transcript", "trim", "style", "audio", "video", "probe", "faces", "words", "dictionary",
+    } | scene_sources(scenes_dir())
+
+
+def test_changing_a_card_source_makes_the_render_run_again(approved_project, monkeypatch, tmp_path,
+                                                            no_output_check):
+    from pipeline.scene_render import scenes_dir
+
+    copy = tmp_path / "scenes"
+    shutil.copytree(scenes_dir() / "src", copy / "src")
+    for name in ("render.mjs", "package-lock.json"):
+        shutil.copyfile(scenes_dir() / name, copy / name)
+    monkeypatch.setattr("pipeline.scene_render.scenes_dir", lambda: copy)
+    p = with_scene(approved_project)
+    stand_in_cards(monkeypatch, tmp_path)
+    calls = []
+    render(p, runner=fake_encoder(calls))
+    assert render(p, runner=fake_encoder(calls))["skipped"] is True
+    card = copy / "src" / "cards" / "keyword-pop.jsx"
+    card.write_text(card.read_text(encoding="utf-8") + "\n// changed\n", encoding="utf-8")
+    assert render(p, runner=fake_encoder(calls))["skipped"] is False
+    assert len(finals_of(calls)) == 2
+
+
+def test_a_render_without_scenes_reads_nothing_of_scenes_and_runs_no_node(approved_project, monkeypatch, tmp_path):
+    def no_node():
+        raise AssertionError("node was looked for")
+
+    monkeypatch.setattr("pipeline.scene_render.scenes_dir", lambda: tmp_path / "not there")
+    monkeypatch.setattr("pipeline.scene_render.node_bin", no_node)
+    assert render(approved_project, force=True)["skipped"] is False
+
+
+def test_a_refused_render_keeps_the_final_file_when_a_card_character_has_no_glyph(approved_project, monkeypatch,
+                                                                                   tmp_path):
+    p = with_scene(approved_project, {"text": "省電\U0001f50b"})
+    content = plant_old_final(p)
+    monkeypatch.setattr("pipeline.scene_render.node_bin", lambda: None)  # the glyphs are refused first
+    with pytest.raises(PipelineError, match=r"the card font \S+ has no glyph for: \U0001f50b \(U\+1F50B\)"):
+        render(p)
+    assert (p.out / "final.mp4").read_bytes() == content
+
+
+def test_a_refused_render_keeps_the_final_file_when_node_is_missing_for_a_clip_not_rendered_yet(approved_project,
+                                                                                                monkeypatch):
+    from pipeline.scene_render import NODE_MISSING
+
+    p = with_scene(approved_project)
+    content = plant_old_final(p)
+    monkeypatch.setattr("pipeline.scene_render.node_bin", lambda: None)
+    with pytest.raises(PipelineError, match=re.escape(NODE_MISSING)):
+        render(p)
+    assert (p.out / "final.mp4").read_bytes() == content

@@ -1,5 +1,5 @@
 """Downloaded assets (static fonts, the YuNet face model, the caption dictionary) and the environment check
-behind `doctor`."""
+behind `doctor` (its Node.js and Remotion items come from scene_render.doctor_items)."""
 
 import hashlib
 import http.client
@@ -235,11 +235,17 @@ def doctor() -> dict:
         "aligner": hf_model_present(hub, "Qwen/Qwen3-ForcedAligner-0.6B"),  # word timestamps need it
     }
 
+    from pipeline import scene_render  # its imports lead back to this module
+
+    remotion, remotion_warnings = scene_render.doctor_items()
+    warnings.extend(remotion_warnings)
+
     free_gb = _free_gb()
     if free_gb < MIN_FREE_GB:
         warnings.append(f"only {free_gb} GB free; keep at least {MIN_FREE_GB} GB free before downloads or renders")
 
-    required = [ffmpeg is not None, libass, h264, hevc, fonts, yunet, caption_dictionary, asr_cli, *asr_models.values()]
+    required = [ffmpeg is not None, libass, h264, hevc, fonts, yunet, caption_dictionary, asr_cli, *asr_models.values(),
+                remotion["node"] is not None, remotion["remotion"], remotion["remotion_browser"]]
     return {
         "ok": all(required),
         "ffmpeg": ffmpeg,
@@ -251,6 +257,7 @@ def doctor() -> dict:
         "caption_dictionary": caption_dictionary,
         "asr_cli": asr_cli,
         "asr_models": asr_models,
+        **remotion,
         "free_gb": free_gb,
         "warnings": warnings,
     }

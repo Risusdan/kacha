@@ -6,12 +6,14 @@ the advance widths of the bold font the render uses. Breaking is done here, neve
 
 Display text: the separators are ，、；：。 and the half-width , ; : and . Shown as written instead, not
 as separators: a half-width , : or . between two letters or digits that are ASCII after NFKC (1,5, １,５,
-10:30, Node.js), a : right before // (https://), and a . next to another one (...). A separator at the end
-of a line goes, one inside a line becomes an ideographic space, and ？ ！ and the quotes and brackets stay.
-Inside a unit's span, where a caption text can put one (吃飯。啦: 啦 joins the unit of 飯), a run of
-separators and spaces shows as it would between two units: it goes after an opening mark and before a
-closing or terminating mark (吃飯。」啦 shows 吃飯」啦), and elsewhere is one ideographic space, or one
-half-width space when the run holds no separator. The Markdown marks that survive in a sentence are not
+10:30, Node.js), a : right before // (https://), and a . next to another one (...). A caption ends at
+every separator but 、 (see below), so no line shows one of them; 、 shows inside a line as written and goes
+from the end of one; ？ ！ and the quotes and brackets stay. A run of spaces and separators between two
+tokens is one character: 、 when that is the only separator in it, an ideographic space (SEPARATOR, where a
+caption ends) when it holds another, and a half-width space when it holds none. Inside a unit's span,
+where a caption text can put one (吃飯。啦: 啦 joins the unit of 飯), a run shows as it would between two
+units: it goes after an opening mark and before a closing or terminating mark (吃飯。」啦 shows 吃飯」啦), and
+elsewhere is that one character. The Markdown marks that survive in a sentence are not
 shown, inside a unit's span either (兩**小**時 as a caption text), by the rule parse_script uses
 (markdown_marks: **x**, __x__, ***x***, ~~x~~, `x`, *x* and a link's brackets); a lone * _ or ~ is text
 (5*3, file_name, 3~5). Spaces between Latin words or numbers and CJK stay as one half-width space.
@@ -19,21 +21,27 @@ shown, inside a unit's span either (兩**小**時 as a caption text), by the rul
 Where a line may break: after a separator, and after ？ or ！ with the marks and closing quotes that
 follow it (a punctuation break); elsewhere across a space, or where a word ends (words.word_ends of the
 sentence text), but never after an opening mark, before a closing or terminating mark or a separator,
-next to any other sign, or inside a run of Latin letters and digits. Inside a stretch between two
-neighbouring breaks that does not fit a line alone (a long word or address, a CJK run with no word end),
-a line may also break between any two characters; nowhere else is a word cut. A space or separator that
-a unit there shows (see Display text) is cut as one between two units is: a line may break after it (a
-punctuation break after a separator) but not before it, and it goes from the end of a line. A unit cut
-there has a piece on each of its lines, with the share of its characters as its share of the unit's time
-(Piece.part; the share of a space or separator that goes shows on no line), and a line that starts or
-ends inside such a stretch, other than right after such a space or separator, has split_word set.
+next to any other sign, or inside a run of Latin letters and digits. One clause per caption: a caption
+ends at every punctuation break but one after 、 alone, however short the clause before it, and each
+clause is broken into lines on its own by the rules below; a clause that fits a line is one line. A unit
+that shows a separator other than 、 (a caption text put one between two of its characters) is cut there,
+as a caption ends there; a piece of it is on each side. Inside a stretch between two neighbouring breaks
+that does not fit a line alone (a long word or address, a CJK run with no word end), a line may also break
+between any two characters; nowhere else is a word cut. A space or 、 that a unit there shows (see Display
+text) is cut as one between two units is: a line may break after it (a punctuation break after 、) but not
+before it, and it goes from the end of a line. A unit cut there or at a separator has a piece on each of
+its lines, with the share of its characters as its share of the unit's time (Piece.part; the share of a
+space or separator that goes shows on no line), and a line that starts or ends inside such a stretch,
+other than right after such a space or separator, has split_word set.
 
-Of all the ways to break a sentence the one taken is the best by, in this order: the fewest lines; the
-fewest short lines (2 characters wide or less, not counted when the whole sentence is that short: such a
-sentence is one line); the fewest breaks that are not punctuation breaks (a break between two characters
-of a long word is one); the least sum of squared differences between the line widths in pixels and
-their mean. Where a long word is cut is chosen by the same rules, with all the other breaks. The best
-is found exactly, by dynamic programming over the breaks.
+Of all the ways to break a clause the one taken is the best by, in this order: the fewest lines; the
+fewest short lines (2 characters wide or less, not counted when the whole clause is that short: such a
+clause is one line); the fewest breaks that are not punctuation breaks (a break between two characters
+of a long word is one); the fewest lines after the first that start with a particle (PARTICLES: 的 地 得
+了 著 們 and the particles that end a sentence, by the first character, whatever word it starts); the
+least sum of squared differences between the line widths in pixels and their mean. Where a long word is
+cut is chosen by the same rules, with all the other breaks. The best is found exactly, by dynamic
+programming over the breaks.
 
 Event times: an event starts when the first unit of its line is spoken and ends one hold after the last
 one, or when the next event starts, whichever is first, and never after the reel ends. A piece of a unit
@@ -63,9 +71,14 @@ from pipeline.style import font_path
 from pipeline.words import word_ends
 
 LONG_WORD_WARNING = "long word split across caption lines"
-SEPARATOR = "　"  # U+3000, what a comma inside a line turns into
+SEPARATOR = "　"  # U+3000: what a run of separators that ends a caption becomes; no line shows it
+ENUMERATION_COMMA = "、"  # the one separator a line shows: a caption ends at every other
 STYLE_NAME = "Caption"
 SHORT_LINE = 2  # a line at most this wide (width_units) is short
+# The characters a line had rather not start with: particles that belong to the words before them (問我用 / 的是哪一套
+# reads badly). A line counts by its first character, not by the word it starts: the dictionary can join a
+# particle to the character after it (認真地去面對: 地去).
+PARTICLES = frozenset("的地得了著們嗎呢吧啊呀啦喔哦嘛耶囉")
 EPS = 1e-9
 
 _OPENERS = frozenset("「『《〈（([【〔“‘")
@@ -222,14 +235,23 @@ def _kind(text: str, i: int) -> str:
     return "other"
 
 
+def _blank(separators: set[str]) -> str:
+    """The one character a run of spaces and separators between two tokens shows, by the separators in it:
+    SEPARATOR when one of them is not 、 (a caption ends there, so no line shows it), 、 when that is the only
+    one, and a half-width space when there is none."""
+    if not separators:
+        return " "
+    return ENUMERATION_COMMA if separators == {ENUMERATION_COMMA} else SEPARATOR
+
+
 def _unit_text(text: str, lo: int, hi: int, marks: set[int]) -> str:
     """What a unit whose span is text[lo:hi] shows: the span as written without the characters of `marks`
     (the indexes of the Markdown marks of the text), with each run of spaces and separators in it (by _kind
     on the whole text, so 1,5 10:30 Node.js and ... stay as written) shown as _tidy shows such a run between
-    two tokens: dropped after an opening mark or before a closing or terminating mark, elsewhere one
-    ideographic space if the run holds a separator and one half-width space if not. A caption text puts a
-    mark or a separator inside a unit's span when it puts one between two characters of the unit
-    (remap_units: 吃飯。啦 shows 吃飯　啦, 吃飯。」啦 shows 吃飯」啦, 兩**小**時 shows 兩小時)."""
+    two tokens: dropped after an opening mark or before a closing or terminating mark, elsewhere one _blank.
+    A caption text puts a mark or a separator inside a unit's span when it puts one between two characters
+    of the unit (remap_units: 吃飯。啦 shows 吃飯　啦, where break_lines ends a caption as between two tokens;
+    吃飯、啦 shows 吃飯、啦; 吃飯。」啦 shows 吃飯」啦; 兩**小**時 shows 兩小時)."""
     shown = [i for i in range(lo, hi) if i not in marks]
     kinds = [_kind(text, i) for i in shown]
     out: list[str] = []
@@ -245,7 +267,7 @@ def _unit_text(text: str, lo: int, hi: int, marks: set[int]) -> str:
         before = kinds[k - 1] if k else None
         after = kinds[j] if j < len(shown) else None
         if before != "open" and after not in ("close", "term"):
-            out.append(SEPARATOR if "sep" in kinds[k:j] else " ")
+            out.append(_blank({text[shown[m]] for m in range(k, j) if kinds[m] == "sep"}))
         k = j
     return "".join(out)
 
@@ -275,8 +297,8 @@ def _tokens(text: str, units: list[dict]) -> list[_Tok]:
 
 def _tidy(toks: list[_Tok]) -> list[_Tok]:
     """`toks` with each run of spaces and separators dropped when it is at either end of the text, after
-    an opening mark, or before a closing or terminating mark; elsewhere it becomes one ideographic space
-    if it held a separator, and one half-width space if not."""
+    an opening mark, or before a closing or terminating mark; elsewhere it becomes one token, its _blank: a
+    "sep" token when that is SEPARATOR or 、, a "space" token when it is a half-width space."""
     out: list[_Tok] = []
     i = 0
     while i < len(toks):
@@ -290,9 +312,8 @@ def _tidy(toks: list[_Tok]) -> list[_Tok]:
         before = out[-1].kind if out else None
         after = toks[j].kind if j < len(toks) else None
         if before not in (None, "open") and after not in (None, "close", "term"):
-            has_separator = any(t.kind == "sep" for t in toks[i:j])
-            blank = Piece(SEPARATOR, None) if has_separator else Piece(" ", None)
-            out.append(_Tok(blank, "sep" if has_separator else "space", toks[i].pos))
+            blank = _blank({t.piece.text for t in toks[i:j] if t.kind == "sep"})
+            out.append(_Tok(Piece(blank, None), "space" if blank == " " else "sep", toks[i].pos))
         i = j
     return out
 
@@ -390,31 +411,59 @@ def _cut_points(toks: list[_Tok], ends: frozenset[int]) -> list[int]:
     return cuts
 
 
-def _breaks(toks: list[_Tok], ends: frozenset[int]) -> dict[int, bool]:
-    """Every place a line of `toks` may break, as {index of the token the next line starts with: whether
-    it is a punctuation break}; words end at `ends` (indexes into the sentence text). A punctuation break
-    is moved past the spaces and separators after it, which trimming takes off either line anyway, so
-    that no line starts with one."""
-    breaks = dict.fromkeys(_cut_points(toks, ends), False)
+def _punctuation_breaks(toks: list[_Tok]) -> dict[int, bool]:
+    """The punctuation breaks of `toks` (_phrase_ends), as {index of the token the next line starts with:
+    whether a caption ends there}. A caption ends at every one but a break after 、 alone. Each is moved past
+    the spaces and separators after it, which trimming takes off either line anyway, so that no line starts
+    with one."""
+    found: dict[int, bool] = {}
     for k in _phrase_ends(toks):
+        ends_caption = toks[k - 1].piece.text != ENUMERATION_COMMA
         while k < len(toks) and toks[k].kind in ("space", "sep"):
             k += 1
         if k < len(toks):
-            breaks[k] = True
+            found[k] = found.get(k, False) or ends_caption
+    return found
+
+
+def _clauses(toks: list[_Tok]) -> list[list[_Tok]]:
+    """`toks` cut wherever a caption ends (_punctuation_breaks): the clauses, each broken into lines on its
+    own. A clause starts with no space or separator; the spaces and separators it ends with are trimmed off
+    its last line."""
+    if not toks:
+        return []
+    bounds = [0, *sorted(k for k, ends_caption in _punctuation_breaks(toks).items() if ends_caption), len(toks)]
+    return [toks[a:b] for a, b in zip(bounds, bounds[1:])]
+
+
+def _open_units(toks: list[_Tok]) -> list[_Tok]:
+    """`toks` with each unit that shows SEPARATOR (a caption text put a separator other than 、 between two
+    of its characters: _unit_text) made into one token per character (_letters), so that a caption ends
+    there as it does between two tokens."""
+    return [t for tok in toks for t in (_letters(tok) if tok.kind == "unit" and SEPARATOR in tok.piece.text
+                                         else [tok])]
+
+
+def _breaks(toks: list[_Tok], ends: frozenset[int]) -> dict[int, bool]:
+    """Every place a line of `toks` may break, as {index of the token the next line starts with: whether
+    it is a punctuation break}; words end at `ends` (indexes into the sentence text). A punctuation break
+    is moved past the spaces and separators after it (_punctuation_breaks)."""
+    breaks = dict.fromkeys(_cut_points(toks, ends), False)
+    breaks.update(dict.fromkeys(_punctuation_breaks(toks), True))
     return breaks
 
 
 def _letters(tok: _Tok) -> list[_Tok]:
     """`tok` as one token per character, each with its share of the unit's characters as `part`. The
-    ideographic or half-width space that _unit_text made of a run inside a unit is a "sep" or "space"
-    token, as that run is between two tokens, so that _trim takes it off the end of a line. A letter's pos is
+    ideographic space, 、 or half-width space that _unit_text made of a run inside a unit is a "sep", "sep" or
+    "space" token, as that run is between two tokens, so that _trim takes it off the end of a line. A letter's pos is
     the unit's pos plus its place in the text the unit shows, which is its place in the sentence text only
     while the unit shows its span as written (no run made one space, no mark left out); nothing reads the pos
     of a letter."""
     size = len(tok.piece.text)
     if size == 1:
         return [tok]
-    blanks = {SEPARATOR: "sep", " ": "space"} if tok.kind == "unit" else {}
+    blanks = {SEPARATOR: "sep", ENUMERATION_COMMA: "sep", " ": "space"} if tok.kind == "unit" else {}
     return [_Tok(Piece(c, tok.piece.unit, (k / size, (k + 1) / size)), blanks.get(c, tok.kind), tok.pos + k)
             for k, c in enumerate(tok.piece.text)]
 
@@ -471,16 +520,18 @@ def _merged(pieces: list[Piece]) -> list[Piece]:
 def _best_bounds(toks: list[_Tok], breaks: dict[int, bool], limits: _Limits) -> list[int]:
     """The bounds of the best lines of `toks` (0, the breaks taken, len(toks)), where `breaks` says where
     a line may break and whether that is a punctuation break. Best is, in this order: the fewest lines,
-    the fewest short lines, the fewest breaks that are not punctuation breaks, the least sum of squared
-    differences between the line widths and their mean.
+    the fewest short lines, the fewest breaks that are not punctuation breaks, the fewest lines after the
+    first that start with one of PARTICLES, the least sum of squared differences between the line widths
+    and their mean.
 
     Exact, by dynamic programming: first the fewest lines n, then over states (break reached, lines so far,
-    their total width), each keeping the least (short lines, breaks not at punctuation, sum of squared
-    widths) of the ways to reach it. The total width is part of the state because breaking at a separator
-    or a space drops it, so breakings into n lines differ in total. Whatever follows a state adds the same
-    to each of those three sums and to the total, and the sum of squared differences from the mean is
-    (n * sum(w²) - total²) / n, so the least of a state's ways is the least for every ending: keeping only
-    it loses nothing. Widths are integers (font units), so every comparison is exact."""
+    their total width), each keeping the least (short lines, breaks not at punctuation, lines that start
+    with a particle, sum of squared widths) of the ways to reach it. The total width is part of the state
+    because breaking at a separator or a space drops it, so breakings into n lines differ in total. Whatever
+    follows a state adds the same to each of those four sums and to the total, and the sum of squared
+    differences from the mean is (n * sum(w²) - total²) / n, so the least of a state's ways is the least for
+    every ending: keeping only it loses nothing. Widths are integers (font units), so every comparison is
+    exact. A line starts with the token at its bound: no break is before a space or a separator."""
     bounds = [0, *sorted(breaks), len(toks)]
     last = len(bounds) - 1
     # lines[a]: (b, width, 1 if short) of every line that may run from bounds[a] to bounds[b]. A line only
@@ -494,7 +545,7 @@ def _best_bounds(toks: list[_Tok], breaks: dict[int, bool], limits: _Limits) -> 
             if b > a + 1 and not limits.fits(line):
                 break
             shown = _shown(line)
-            # a sentence short as a whole fits one line and never gets here: its exemption needs no code
+            # a clause short as a whole fits one line and never gets here: its exemption needs no code
             found.append((b, _advance(shown, limits.font), int(width_units(shown) <= SHORT_LINE)))
         lines.append(found)
 
@@ -505,23 +556,25 @@ def _best_bounds(toks: list[_Tok], breaks: dict[int, bool], limits: _Limits) -> 
             fewest[b] = min(fewest[b], fewest[a] + 1)
     count = fewest[last]
 
-    # states[b][(lines so far, their total width)] = ((short, not punctuation, squares), the state before)
+    # states[b][(lines so far, their total width)] = ((short, not punctuation, particle, squares), the state
+    # before)
     states: list[dict] = [{} for _ in range(last + 1)]
-    states[0][(0, 0)] = ((0, 0, 0), None)
+    states[0][(0, 0)] = ((0, 0, 0, 0), None)
     for a in range(last):
         for (made, total), (cost, _) in states[a].items():
             for b, width, short in lines[a]:
                 if made + 1 > count or (b == last) != (made + 1 == count):
                     continue
                 plain = int(b < last and not breaks[bounds[b]])
-                step = (cost[0] + short, cost[1] + plain, cost[2] + width * width)
+                particle = int(b < last and toks[bounds[b]].piece.text[:1] in PARTICLES)
+                step = (cost[0] + short, cost[1] + plain, cost[2] + particle, cost[3] + width * width)
                 key = (made + 1, total + width)
                 if key not in states[b] or step < states[b][key][0]:
                     states[b][key] = (step, (a, (made, total)))
 
-    def overall(item) -> tuple[int, int, int]:
+    def overall(item) -> tuple[int, int, int, int]:
         (_, total), (cost, _) = item
-        return cost[0], cost[1], count * cost[2] - total * total
+        return cost[0], cost[1], cost[2], count * cost[3] - total * total
 
     _, (_, came) = min(states[last].items(), key=overall)
     taken = [last]
@@ -537,18 +590,22 @@ def break_lines(text: str, units: list[dict], font: Path, style: dict) -> list[L
     with a `span` into `text`) are those of a transcript.json sentence; `font` is the static font the
     render uses; the limits come from style captions.max_chars_per_line, size_px, outline_px and the safe
     area. The result has the pieces of every unit, in order (a unit cut across lines one on each of its
-    lines), and no line is empty. A sentence that needs more than one line needs the caption dictionary
-    (word_ends raises PipelineError without it)."""
+    lines), and no line is empty. A clause too wide for one line needs the caption dictionary (word_ends
+    raises PipelineError without it)."""
     limits = _limits(font, style)
-    toks = _tidy(_tokens(text, units))
-    if not toks:
-        return []
-    if limits.fits(toks):
-        return [Line([tok.piece for tok in _trim(toks)])]
-    toks, breaks, inside = _split_wide(toks, _breaks(toks, word_ends(text)), limits)
-    bounds = _best_bounds(toks, breaks, limits)
-    return [Line(_merged([tok.piece for tok in _trim(toks[a:b])]), split_word=a in inside or b in inside)
-            for a, b in zip(bounds, bounds[1:])]
+    lines: list[Line] = []
+    ends: frozenset[int] | None = None
+    for clause in _clauses(_open_units(_tidy(_tokens(text, units)))):
+        if limits.fits(clause):
+            lines.append(Line(_merged([tok.piece for tok in _trim(clause)])))
+            continue
+        if ends is None:
+            ends = word_ends(text)
+        toks, breaks, inside = _split_wide(clause, _breaks(clause, ends), limits)
+        bounds = _best_bounds(toks, breaks, limits)
+        lines.extend(Line(_merged([tok.piece for tok in _trim(toks[a:b])]), split_word=a in inside or b in inside)
+                     for a, b in zip(bounds, bounds[1:]))
+    return lines
 
 
 # ---- caption text from edit.json --------------------------------------------------------------

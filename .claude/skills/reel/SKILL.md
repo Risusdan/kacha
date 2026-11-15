@@ -46,7 +46,10 @@ description: 把一支口播影片剪成有字幕的 Reels，帶著整個流程�
 
 第一次使用，或指令說缺字型、缺模型、缺字典時：`uv run pipeline doctor` 列出缺什麼。任何一項不通過，`ok` 就是 `false`，結束碼是 1。這時輸出裡沒有 `error`，要看下面各個欄位和 `warnings`。
 
-- 缺字幕字型、臉部偵測模型或斷詞字典（`fonts`、`yunet` 或 `caption_dictionary` 是 `false`）：先告訴使用者，再跑 `uv run pipeline setup`。`setup` 只下載這三樣；它的結果有 `fonts`、`yunet` 和 `dictionary`（字典檔的路徑）。斷詞是把一句話切成一個個詞：字幕斷行只在詞和詞之間或標點後面，靠斷詞字典找詞的邊界。缺字典時，`storyboard` 和 `render` 會拒絕（`trim` 有時也會），訊息叫你跑 `setup`。臉部偵測模型是 `prep` 偵測臉用的，結果留給第 2 期的畫面推近，本期的字幕不看臉。
+- 缺字幕字型、臉部偵測模型或斷詞字典（`fonts`、`yunet` 或 `caption_dictionary` 是 `false`）：先告訴使用者，再跑 `uv run pipeline setup`。`setup` 下載這三樣，也補齊做動畫卡片的工具（見下一項）；它的結果有 `fonts`、`yunet`、`dictionary`（字典檔的路徑）、`remotion` 和 `remotion_browser`。斷詞是把一句話切成一個個詞：字幕斷行只在詞和詞之間或標點後面，靠斷詞字典找詞的邊界。缺字典時，`storyboard` 和 `render` 會拒絕（`trim` 有時也會），訊息叫你跑 `setup`。臉部偵測模型是 `prep` 偵測臉用的，結果給畫面推近當錨點；字幕不看臉。
+- 做動畫卡片的工具不齊（`node` 是 `null`，或 `remotion`、`remotion_browser` 是 `false`）：`render` 用 Remotion（做動畫的程式庫）把卡片渲染成影片，要這三項。`node` 是 Node.js（執行 Remotion 的環境）的路徑，要 Node.js 18.18 以上，找不到或太舊就是 `null`，`warnings` 會說原因；`remotion` 是 `scenes/node_modules` 裝的 Remotion 是不是鎖定的版本；`remotion_browser` 是 Remotion 渲染用的瀏覽器下載了沒有。沒有動畫的專案用不到它們，但 `doctor` 都檢查，缺一項 `ok` 就是 `false`。
+  - `node` 是 `null`：你不能補，告訴使用者裝 Node.js 18.18 以上，然後停下來。Remotion 或瀏覽器也缺的話，`setup` 下載完字型、模型和字典之後，會回 `node (Node.js 18.18 or later) not found: install it, then run uv run pipeline setup`（太舊時說版本太舊）；兩樣都在的話，`setup` 照樣成功，`doctor` 的 `node` 仍是 `null`。他裝好之後，跑 `setup`，再跑一次 `doctor`。
+  - `remotion` 或 `remotion_browser` 是 `false`：先告訴使用者，再跑 `uv run pipeline setup`。它跑 `npm ci` 照 `scenes/package-lock.json` 裝 Remotion（不跑套件的安裝腳本），再下載瀏覽器（約 459 MB），各自只在缺的時候做。
 - 缺語音辨識（ASR，automatic speech recognition）模型（`asr_models` 裡的 `1.7b`、`0.6b` 或 `aligner` 是 `false`）：告訴使用者，然後停下來。`setup` 不下載它們，語音辨識執行時也不連網，你不要自己去下載。
 - `asr_cli` 是 `false`：語音辨識的指令 `mlx-qwen3-asr` 不在專案的 Python 環境裡，`transcribe` 跑不起來。`setup` 不處理它。告訴使用者，經他同意再跑 `uv sync`（照 `uv.lock` 把環境補齊），再跑一次 `doctor`。
 - `ffmpeg` 是 `null`：找不到 ffmpeg（`pipeline` 用來處理影片和音訊的工具，`warnings` 會說原因）。你不能補，告訴使用者，然後停下來。他裝好之後，如果不在 `pipeline` 預設找的位置，要用環境變數 `REELS_FFMPEG_DIR` 指到放 `ffmpeg` 的資料夾。`ffmpeg` 是 `null` 時，下面的 `libass`、`h264_videotoolbox`、`hevc_videotoolbox` 也都是 `false`（沒有 ffmpeg，這三項沒法檢查）：先處理 ffmpeg，再跑一次 `doctor`，那三項才有意義。
@@ -69,7 +72,7 @@ uv run pipeline new <影片> <腳本> --slug <英文代稱>
 uv run pipeline prep <專案>
 ```
 
-抽出音訊，也偵測臉的位置（記下來給第 2 期的畫面推近用；本期的字幕固定在畫面下方置中，不看臉）。結果有 `warnings`、`is_hdr`、`is_vfr`、`duration_s`。
+抽出音訊，也偵測臉的位置（記下來給畫面推近當錨點；字幕固定在畫面下方置中，不看臉）。結果有 `warnings`、`is_hdr`、`is_vfr`、`duration_s`。
 
 - `aspect W:H will be center-cropped to 9:16`：告訴使用者畫面不是 9:16，會置中裁切成 9:16。
 - `is_hdr` 為 `true`：素材是 HDR（高動態範圍）影片。前處理會多一道轉成 SDR（標準動態範圍）的步驟，比較久，先跟使用者說一聲。
@@ -112,10 +115,12 @@ uv run pipeline validate <專案>
 `transcribe` 或 `trim` 重跑過，不管 `next` 是 `edit` 還是 `validate`，都照這個順序做，做完才能跑 `validate`：
 
 1. 讀新的 `work/trim.json`，`edit.json` 裡每一個候選，都從新的候選重新決定接受或拒絕（看它現在的種類、辨識文字和 `suggest`），不沿用舊的決定。新的候選每一個都要決定，新的 `trim.json` 沒有的代號要拿掉。`notes` 裡候選的註記也照新的候選重寫。
-2. 讀新的 `work/transcript.json`，`cuts.extra` 的 `from`、`to` 和 `sentences` 的每一筆，都對照現在的句子（內容、`spoken`）重新核對：同一個代號是不是還是那一句，講者有講的句子是不是都有一筆，沒講到的有沒有誤寫進去。`captions.text` 和 `notes` 裡的句子代號也一樣核對；改過的字幕還要不要留，也看一下（例如使用者已經把腳本改好，就不用了）。
+2. 讀新的 `work/transcript.json`，`cuts.extra` 的 `from`、`to` 和 `sentences` 的每一筆，都對照現在的句子（內容、`spoken`）重新核對：同一個代號是不是還是那一句，講者有講的句子是不是都有一筆，沒講到的有沒有誤寫進去。`captions.text`、`notes`、`punch_in` 和 `scenes`（`at`、`until` 的句子，和 `char` 指的字）裡的句子代號也一樣核對；改過的字幕還要不要留，也看一下（例如使用者已經把腳本改好，就不用了）。
 3. 改好，或確定都不用改，再跑 `validate`。
 
 跑 `validate` 時，如果 `edit.json` 的內容和上次檢查時一模一樣，卻是對舊的 `transcript.json` 或 `trim.json` 檢查的，通過的結果會多一個 `warnings`：`edit.json is unchanged since it was checked against an older transcript.json or trim.json: trim and sentence ids may now point at different candidates`。這表示 `pipeline` 看不出你有沒有重新核對。看到它，就用中文轉述給使用者，並講你重新核對的結果。用句子的內容和時間說，不講代號。例如：「剪輯的決定和上次一模一樣，但中間轉錄重跑過，決定裡指定的哪一段、哪一句，可能對到不同的位置。我已經逐一重新核對，原本的決定都還成立。」還沒核對就看到這個警告，先回頭做上面三步，再轉述。
+
+`warnings` 也可能有以 `punch_in.` 開頭的一行：推近的一筆設定不起作用，處理方式見 `storyboard` skill 的「punch_in：推近」。以 `scenes[` 開頭的一行：一段動畫被剪接擋住、出不來，或剪完不到 1 秒，處理方式見 `storyboard` skill 的「scenes：動畫」。
 
 ## 7. 做出分鏡稿
 
@@ -230,6 +235,7 @@ uv run pipeline review <專案>
    | `aspect W:H will be center-cropped to 9:16` | 畫面不是 9:16，會置中裁切成 9:16 |
    | `few pauses: quiet-point detection unreliable` | 停頓很少，切點是否在靜音裡的判斷不可靠 |
    | `long word split across caption lines` | 有詞太長，字幕從詞的中間斷開（一個英文詞或網址比一行還寬，只好斷在字元之間；那一句在網頁上標「有詞太長，從中間斷開」） |
+   | 以 `scenes[` 開頭的 | 一段動畫出不來，或剪完不到 1 秒：照 `storyboard.md` 警告裡的中文說是哪張卡、上面寫什麼，問他要移到哪裡或拿掉 |
    | `preview over 30 MiB: not kept` | 手機預覽版超過 30 MiB（對話傳檔的上限），沒有留；成品照樣完成（這則出現在第 9 節 `render` 的結果裡） |
    | 以 `preview failed:` 開頭的 | 手機預覽版做不出來，把冒號後面的原因轉述；成品照樣完成（同上，出現在 `render` 的結果裡） |
 
@@ -301,6 +307,14 @@ uv run pipeline review <專案>
 | 這一句的字幕是辨識出來的 | `transcript.json` 的 `sentences` 裡這一句的 `display_source` 是 `"asr"` | 這句裡的腳本外的話和改詞重講都不是候選（剪掉它們，字幕就對不上了），它們已經在這一句的字幕裡。要拿掉，就把這一整句拿掉（`cuts.extra`，`from` 和 `to` 都填這一句）；不然就留著，或請使用者重錄 |
 | 其他位置 | `display_source` 是 `"script"` | 腳本外的話已經是候選，照候選處理 |
 
+### 推近
+
+預設不推近：整支都是原尺寸。使用者要某個地方放大（或放大多一點、不要放大了）時，照 `storyboard` skill 的「punch_in：推近」改 `edit.json`，接著和其他改動一樣 `validate`、`storyboard`（審閱頁開著時 `validate` 就好），告訴他實際放大的時間，再問一次同意。放大的地方列在分鏡稿句子表的「推近」欄和摘要的「推近」，審閱頁播放時照樣放大。關卡 1 的訊息不用另外講推近，也不要自己建議推近。審閱頁不能改推近，要改就在對話裡說。
+
+### 動畫
+
+預設沒有動畫。使用者要某個地方放動畫卡片（或改卡片上的字、不要這段動畫了）時，照 `storyboard` skill 的「scenes：動畫」改 `edit.json`，接著和其他改動一樣 `validate`、`storyboard`（審閱頁開著時 `validate` 就好），告訴他卡片上寫什麼、實際從幾秒到幾秒，再問一次同意。本期有三張卡：重點字、數字卡、清單。動畫列在分鏡稿句子表的「動畫」欄和摘要的「動畫」；審閱頁播到那段時，在影片上方標出卡片的名稱和文字，不播真的動畫。關卡 1 的訊息不用另外講動畫，也不要自己建議加動畫。審閱頁不能改動畫，要改就在對話裡說。
+
 ### 做完之後
 
 `transcribe` 和 `trim` 重跑完，`next` 通常是 `edit`，`edit.json` 還沒檢查過的專案是 `validate`。兩種都一樣：先照第 6 節逐一重新核對 `edit.json`，再 `validate`、`storyboard`。
@@ -324,6 +338,13 @@ uv run pipeline render <專案>
 ```
 
 `render` 也處理聲音：切掉 80 Hz 以下、降噪、等化，整支拉到 -14 LUFS，峰值壓在 -1 dB 以內（設計文件 8.7 節「聲音」）。使用者覺得聲音太小、有雜音或偏悶時，告訴他成品已經做過這些處理；要再調，是改程式，不是改 `edit.json`。
+
+有動畫的專案，`render` 先把每段動畫渲染成一支透明的影片，存在 `work/scenes/`，再疊到口播畫面上，最後才燒字幕。第一次要多花一點時間；同一張卡、同樣的字和長度，下一次輸出直接用存好的，不重新渲染。`render` 在動手之前拒絕這些情形，`out/final.mp4` 照舊不動：
+
+- `the card font … has no glyph for: …`：卡片上有字型畫不出來的字（後面列出那些字）。照 `storyboard` skill 的「scenes：動畫」改卡片上的字，重做分鏡稿，取得新的同意。
+- `node (Node.js 18.18 or later) not found: install it, then run uv run pipeline setup`、`scenes/node_modules is not installed at the locked versions: run uv run pipeline setup`、`the browser Remotion renders with is not downloaded: run uv run pipeline setup`：做卡片的工具不齊，照第 1 節處理。存好的動畫影片都在的話，不用這些工具也能輸出。
+
+渲染卡片失敗時，`error` 以 `the animation cards failed to render:` 開頭，`log` 是 `work/scenes.log`：讀它，照第 10 節。渲染卡片的程式跑不起來或超過時間時，`error` 以 `cannot run scenes/render.mjs:` 開頭，沒有 `log`：照第 10 節。
 
 結果的 `out` 是 `out/final.mp4` 的位置，還有 `duration_s` 和 `size_mb`。渲染失敗會自動重試一次（`attempts` 為 2）；還失敗就照第 10 節。結果還有手機預覽版的三個欄位：`preview`（`out/preview.mp4` 的位置，做不出來時是 `null`）、`preview_mb`（檔案大小，單位 MB，只在有預覽版時才有）和 `warnings`（預覽版的警告，翻成中文的對照見第 8 節的表）。預覽版做不出來不會讓 `render` 失敗，成品照樣完成。
 
@@ -356,7 +377,7 @@ uv run pipeline render <專案>
 使用者貼上腳本，或請你幫忙整理腳本時，提醒這幾點：
 
 - 一句話在 `。`、`！`、`？`（半形的 `!` `?` 也算）或換行處結束。每句一行最穩。
-- 標點最好用全形：`，。？！、：；`。半形的 `,` `;` `:` `.` 不會切開句子，但字幕會把它們當成標點，和全形的 `，；：` 一樣處理：在這裡切成短語，在行中變成全形空白，在行尾拿掉。下面三種照原樣顯示：英文字母或數字之間的 `,` `:` `.`（`1,000`、`10:30`、`3.5`、`Node.js`），網址 `https://` 的 `:`，連在一起的 `...`。
+- 標點最好用全形：`，。？！、：；`。半形的 `,` `;` `:` `.` 不會切開句子，但字幕會把它們當成標點，和全形的 `，；：` 一樣處理：字幕在這裡換下一行，標點本身不顯示。下面三種照原樣顯示：英文字母或數字之間的 `,` `:` `.`（`1,000`、`10:30`、`3.5`、`Node.js`），網址 `https://` 的 `:`，連在一起的 `...`。
 - Markdown 的記號可以用，它們不是講的話：成對的 `**`、`__`、`~~`、`***`、單星號斜體（`*很重要*`）和反引號，記號本身會從腳本和字幕拿掉，包在裡面的字留著；連結 `[文字](網址)` 只留「文字」，網址不會進腳本，也不會進字幕。單獨一個 `*`、`_`、`~`（例如 `5*3`、`file_name`、`3~5`）是一般的字，會留在字幕裡。
 - 行首的序號不是講的話，會拿掉：`1.`、`2)` 後面要有空格（`1. 先關螢幕。` 變成 `先關螢幕。`），後面直接接字的 `1.先關螢幕。`、`2)第二點。` 不算序號，數字會留在腳本和字幕裡，所以序號後面要加空格；`3、` 後面不用空格（`3、先關。` 變成 `先關。`）。只有序號的一行（`1.`、`10)`）不算一句話，不會多出一個句子。一行裡的數字清單（`1、2、3 都是。`）是講的話，照原樣留著。
 - `[B-roll: 咖啡店]`（B-roll 是穿插在口播之間的補充畫面）、`【螢幕：設定步驟】`、單獨一行的（這裡放咖啡店外觀）是備註，不是講的話，不會變成字幕。本期的成品用不到它們。

@@ -14,8 +14,18 @@ The picture is cut by frame number: the leading setpts makes the first video fra
 of work/audio48k.wav, fps=30 puts the frames on the grid the segments are on (and makes the pts of a frame its
 number), and select keeps the frames whose number is inside a segment.
 
-The captions sit at the fixed top caption_top_px gives (the style's captions.bottom_px less its line height), whatever
-the picture shows, so the render reads no faces.json.
+Each segment is a shot of the punch-in (pipeline.punch, docs/superpowers/specs/2026-11-15-punch-in-design.md): crop
+takes the base window (the centre 9:16 of the picture) and zoompan, frame by frame, the part of it the shot shows
+about its anchor, scaled to 1080x1920. The anchors come from work/faces.json; the base window is worked out from the
+size of the picture the render reads (prep's SDR copy for an HDR source), which ffprobe gives.
+
+The animation cards (pipeline.scenes, docs/superpowers/specs/2026-11-15-remotion-foundation-design.md) are laid over
+the picture after zoompan: each scene that shows is a transparent clip under work/scenes (pipeline.scene_render), which
+is rendered before ffmpeg runs when it is not there yet, and overlaid from the reel frame the scene starts at. A reel
+without scenes reads nothing of scenes/ and runs no Node.
+
+The captions are burnt in last, over the cards, at the fixed top caption_top_px gives (the style's captions.bottom_px
+less its line height), whatever the picture shows and however far it is punched in.
 
 The video bitrate is 12 Mbps for a reel up to about 3 minutes and lower for a longer one, so that the file stays
 under 300 MB (see video_bitrate); the audio is voice.wav as AAC at 192 kbit/s.
@@ -28,18 +38,22 @@ cannot be made, final.mp4 is still the result and the result carries a warning.
 import math
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
+from pipeline import punch, scene_render
 from pipeline.captions import build_events, caption_top_px, missing_glyphs, write_ass
-from pipeline.edit import Segment, build_segments, load_document, require_valid, total_duration
+from pipeline.edit import Segment, load_document, require_valid, total_duration
 from pipeline.errors import PipelineError
-from pipeline.media import FFPROBE_TIMEOUT_S, ffprobe_json, run_ffmpeg
+from pipeline.media import FFPROBE_TIMEOUT_S, ffprobe_json, probe, run_ffmpeg
 from pipeline.project import Project, first_stale_step, gate_ok, run_step
+from pipeline.punch import Shot, base_window, window
+from pipeline.scene_render import check_renderable, render_scenes, source_files
+from pipeline.scenes import scene_spans
 from pipeline.style import font_path, load_style
 from pipeline.voice import treat_voice
 from pipeline.words import caption_inputs
@@ -157,6 +171,37 @@ def select_expr(segments: list[Segment]) -> str:
     return _balanced_sum(terms) if terms else ""
 
 
+def _nearest_even(value: float) -> int:
+    return round(value / 2) * 2
+
+
+def zoom_exprs(shots: list[Shot], base: tuple[int, int, int, int]) -> tuple[str, str, str]:
+    """zoompan's z, x and y for `shots` (punch.shots) out of the base window `base` (x, y, w, h in pixels of the
+    picture, punch.base_window): for each shot punched in, a term gte(on,A)*lt(on,B)*value over the frames A to B-1
+    of the reel that it fills (on is the number of zoompan's output frame, which after select is the frame of the
+    reel; a shot fills as many frames as select keeps of it), added up as select's terms are (see _balanced_sum).
+    z is 1 plus the scale less 1; x and y are the top-left of punch.window in pixels of the base window, to the
+    nearest even pixel (yuv420 has one chroma sample per 2x2 pixels; zoompan would move an odd one down). A shot at
+    the base framing has no term: z 1, x and y 0."""
+    _, _, width, height = base
+    z, x, y = [], [], []
+    first = 0
+    for shot in shots:
+        count = round(shot.end * FPS) - round(shot.start * FPS)
+        if shot.scale != 1:
+            span = f"gte(on,{first})*lt(on,{first + count})"
+            left, top, _, _ = window((shot.ax, shot.ay), shot.scale)
+            z.append(f"{span}*{shot.scale - 1:.6g}")
+            x += [f"{span}*{px}"] if (px := _nearest_even(left * width)) else []
+            y += [f"{span}*{px}"] if (px := _nearest_even(top * height)) else []
+        first += count
+    return (
+        f"1+{_balanced_sum(z)}" if z else "1",
+        _balanced_sum(x) if x else "0",
+        _balanced_sum(y) if y else "0",
+    )
+
+
 def _ffmpeg_rate(bits_per_s: int) -> str:
     """`bits_per_s` the way ffmpeg reads it: in whole kilobits, always spelled with k, whatever the rate (ffmpeg's
     k is 1000), so 12 Mbit/s is 12000k."""
@@ -164,25 +209,47 @@ def _ffmpeg_rate(bits_per_s: int) -> str:
 
 
 def build_ffmpeg_args(
-    video_src: Path, sound_wav: Path, segments: list[Segment], out: Path, filter_script: Path
+    video_src: Path, sound_wav: Path, shots: list[Shot], base: tuple[int, int, int, int], out: Path,
+    filter_script: Path, scenes: Sequence[tuple[int, Path]] = (),
 ) -> list[str]:
     """Write the filter graph to `filter_script` and return the ffmpeg arguments that render `out` from the
-    picture of `video_src` and the sound of `sound_wav` (already cut, and treated: voice.wav). The graph names
-    captions.ass and fonts relative to the folder ffmpeg runs in. A frame rate of 30 and one scale to cover 1080x1920 (every source is scaled
-    once). The video bitrate is the one video_bitrate gives for the length the segments add up to; it is worked
-    out first, so a reel too long for MIN_VIDEO_BITRATE raises before the script is written, as does a list of no
-    segments."""
-    if not segments:
+    picture of `video_src` and the sound of `sound_wav` (already cut, and treated: voice.wav). The reel is the
+    stretches of `shots` (punch.shots), each framed as it says, out of the base window `base` (x, y, w, h in pixels
+    of the picture of `video_src` as ffmpeg delivers it, turned upright: punch.base_window). The graph names
+    captions.ass and fonts relative to the folder ffmpeg runs in. A frame rate of 30; crop takes the base window and
+    zoompan the part of it each shot shows (zoom_exprs), scaled to 1080x1920: every frame is scaled once. The video
+    bitrate is the one video_bitrate gives for the length the shots add up to; it is worked out first, so a reel
+    too long for MIN_VIDEO_BITRATE raises before the script is written, as does a list of no shots.
+
+    Each of `scenes` is (the reel frame it starts at, its clip): a transparent 1080x1920 clip (scene_render), given
+    to ffmpeg as an input of its own after the sound, so that its path stays out of the graph. setpts moves the clip
+    to its frame and overlay lays it over the zoomed picture; eof_action=pass shows the picture as it is once the
+    clip ends. The captions are burnt in after the last overlay, over the cards."""
+    if not shots:
         raise PipelineError("nothing to render: the reel has no segments")
+    segments = [Segment(shot.start, shot.end) for shot in shots]
     rate = video_bitrate(total_duration(segments))
-    graph = (
+    x, y, w, h = base
+    z_expr, x_expr, y_expr = zoom_exprs(shots, base)
+    picture = (
         f"[0:v]setpts=PTS-STARTPTS,fps={FPS},select='{select_expr(segments)}',setpts=N/{FPS}/TB,"
-        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},"
-        "subtitles=filename=captions.ass:fontsdir=fonts,format=yuv420p[v]"
+        f"crop={w}:{h}:{x}:{y},"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}"
     )
+    captions = "subtitles=filename=captions.ass:fontsdir=fonts,format=yuv420p[v]"
+    if scenes:
+        chain, below = [f"{picture}[picture]"], "picture"
+        for i, (start, _) in enumerate(scenes):
+            chain.append(f"[{i + 2}:v]setpts=PTS-STARTPTS+{start}/{FPS}/TB[scene{i}]")
+            chain.append(f"[{below}][scene{i}]overlay=eof_action=pass[with{i}]")
+            below = f"with{i}"
+        graph = ";".join([*chain, f"[{below}]{captions}"])
+    else:
+        graph = f"{picture},{captions}"
     Path(filter_script).write_text(graph, encoding="utf-8")
+    clips = [arg for _, clip in scenes for arg in ("-i", str(clip))]
     return [
-        "-hide_banner", "-loglevel", "verbose", "-y", "-i", str(video_src), "-i", str(sound_wav),
+        "-hide_banner", "-loglevel", "verbose", "-y", "-i", str(video_src), "-i", str(sound_wav), *clips,
         "-/filter_complex", str(filter_script), "-map", "[v]", "-map", "1:a",
         "-c:v", VIDEO_ENCODER, "-b:v", _ffmpeg_rate(rate), "-profile:v", "high", "-r", str(FPS),
         "-fps_mode", "cfr", "-tag:v", "avc1",
@@ -397,9 +464,16 @@ class _Plan:
             font = font_path(self.style, weight)
             if not font.is_file():
                 raise PipelineError(f"font {font.name} not found: run `uv run pipeline setup`")
-        probe = load_document(p.work / "probe.json", "prep", ("video_source", "display_w", "display_h"))
-        self.video = Path(probe["video_source"])
-        self.segments = build_segments(edit, transcript, trims)
+        prepped = load_document(p.work / "probe.json", "prep", ("video_source", "display_w", "display_h"))
+        self.video = Path(prepped["video_source"])
+        faces = load_document(p.work / "faces.json", "prep", ("boxes",))
+        # The base window is of the picture the render reads, which for an HDR source is prep's SDR copy, smaller
+        # than the source probe.json describes. Face boxes are in 0-1 of the picture, so either size places them.
+        picture = probe(self.video)
+        self.base = base_window(picture.display_w, picture.display_h)
+        size = {"display_w": picture.display_w, "display_h": picture.display_h}
+        self.shots = punch.shots(edit, transcript, trims, faces, size)
+        self.segments = [Segment(shot.start, shot.end) for shot in self.shots]
         self.duration_s = total_duration(self.segments)
         self.video_bitrate = video_bitrate(self.duration_s)  # refuses a reel too long for the size limit, early
         caps = self.style["captions"]
@@ -413,6 +487,10 @@ class _Plan:
                 characters=missing,
             )
         self.top_px = caption_top_px(self.style)
+        # The scenes that show, each with its reel frame and its length; what would stop their clips from being
+        # rendered is refused here, before anything is touched (no scenes: scenes/ is not read, Node not run).
+        self.placed = scene_spans(edit, transcript, trims)
+        check_renderable(p, self.placed, self.style)
 
 
 def _result(final: Path, plan: _Plan, attempts: int) -> dict:
@@ -437,9 +515,11 @@ def _make(p: Project, plan: _Plan, final: Path, runner: Callable) -> dict:
               font=plan.font)
     cut_audio(p.work / "audio48k.wav", plan.segments, work / "cut.wav")
     treat_voice(work / "cut.wav", work / "voice.wav", work / "voice.log")
+    clips = render_scenes(p, plan.placed, plan.style)
 
     temp, log = p.out / "final.tmp.mp4", work / "render.log"
-    args = build_ffmpeg_args(plan.video, work / "voice.wav", plan.segments, temp, work / "filter.txt")
+    args = build_ffmpeg_args(plan.video, work / "voice.wav", plan.shots, plan.base, temp, work / "filter.txt",
+                             scenes=[(item.start, clip) for item, clip in clips])
     try:
         for attempts in range(1, ATTEMPTS + 1):
             temp.unlink(missing_ok=True)
@@ -464,6 +544,15 @@ def _make(p: Project, plan: _Plan, final: Path, runner: Callable) -> dict:
     return {**_result(final, plan, attempts), "video_bitrate": plan.video_bitrate}
 
 
+def _card_sources(plan: _Plan) -> dict[str, Path]:
+    """The card sources (scene_render.source_files) as inputs named scenes/<their path>, when the reel shows a
+    scene; none otherwise, so that a reel without scenes does not read scenes/."""
+    if not plan.placed:
+        return {}
+    folder = scene_render.scenes_dir()
+    return {f"scenes/{path.relative_to(folder).as_posix()}": path for path in source_files(folder)}
+
+
 def render(p: Project, force: bool = False, runner: Callable = run_ffmpeg) -> dict:
     """Render out/final.mp4 from the approved edit. Returns out (path), duration_s (of the cut reel), size_mb,
     attempts (ffmpeg runs: 2 after a retry, 0 when the step was skipped), video_bitrate (bit/s, the one given to
@@ -477,10 +566,13 @@ def render(p: Project, force: bool = False, runner: Callable = run_ffmpeg) -> di
     first. The step is skipped when no input changed since the last render and final.mp4 is still there;
     `force` renders again. `runner(args, log, cwd=...)` runs ffmpeg (run_ffmpeg); a PipelineError from it is an
     attempt that failed. An edit.json that does not pass raises EditInvalid; a caption character the font cannot
-    draw, a reel so long that the size limit would need a video bitrate under MIN_VIDEO_BITRATE (refused before
-    final.mp4 or anything else is touched), a style font or the caption dictionary that is not there (the same),
+    draw, a card character the style's fonts cannot draw, a clip of a card that is not rendered yet while node, the
+    modules or the browser are missing, a reel so long that the size limit would need a video bitrate under
+    MIN_VIDEO_BITRATE (all refused before final.mp4 or anything else is touched), a style font, the caption dictionary
+    or a readable work/faces.json that is not there (the same),
     an output that breaks the spec and a font libass took from the system raise PipelineError. The caption word
-    list and the dictionary are inputs of the step, as they are of the storyboard (words.caption_inputs).
+    list and the dictionary are inputs of the step, as they are of the storyboard (words.caption_inputs), and so are
+    the card sources (scene_render.source_files) when the reel shows a scene.
 
     A render that actually runs removes the old final.mp4 and the old preview.mp4 first, before it writes anything
     else, so a render that then fails leaves neither of an earlier edit (a refused or skipped render does not touch
@@ -509,7 +601,9 @@ def render(p: Project, force: bool = False, runner: Callable = run_ffmpeg) -> di
         "audio": p.work / "audio48k.wav",
         "video": plan.video,
         "probe": p.work / "probe.json",
+        "faces": p.work / "faces.json",  # the anchors of the punch-in
         **caption_inputs(),  # the caption lines are broken where these say a word ends
+        **_card_sources(plan),  # what the cards look like, when there are any
     }
 
     def run() -> dict:

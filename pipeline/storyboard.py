@@ -2,8 +2,9 @@
 
 review/gate1/index.html is one light-mode file with no external reference: the thumbnails and the
 clips are embedded as data URIs, so it opens on a phone as it is. From the top it shows the title, the
-project name, a summary (source length, new length, how many pieces are cut, how many decisions, how
-many other places to listen to), the warnings, the two lists of review_items (要你決定, then
+project name, a summary (source length, new length, how many pieces are cut, how many cut points the reel
+has and how many of its shots are punched in, how many decisions, how many other places to listen to), the
+warnings, the two lists of review_items (要你決定, then
 其他要聽的地方), a table with one row per script sentence and a table with one row per rough-cut
 candidate. No width is fixed: at 640 px wide or less each table row becomes a card and every cell
 shows its column name (its data-label). review/gate1/storyboard.md holds the summary, the warnings,
@@ -28,11 +29,18 @@ The pieces cut are the accepted candidates that are in the reel (review_items.tr
 cuts.extra ranges.
 
 A sentence row is one of three kinds. A kept sentence shows its caption lines (what build_events would
-put on screen, lines joined with " / "), the time it starts in the cut reel, its sem tag and weight, and
-a thumbnail. A sentence that cuts.extra removes is struck through, with the reason of the range, and has
+put on screen, lines joined with " / "), the time it starts in the cut reel, its sem tag and weight, the
+span in the reel and scale of each shot punched in that starts in it (punch.framings:
+0:02.8 到 0:05.1 放大 1.1 倍; nothing when no such shot starts in it), each scene that starts in it as its card's
+name, its texts and its span in the reel (數字卡：兩小時／一天多撐（0:12.0 到 0:14.5）, joined by 、; nothing when none
+does), and a thumbnail. A sentence that cuts.extra removes is struck through, with the reason of the range, and has
 a thumbnail but no time. A sentence the speaker did not say shows only "沒講到". A kept sentence with a
 line that starts or ends inside a long word says so, and adds LONG_WORD_WARNING to the warnings. A row
 that list items are about names their numbers. A sentence row has no clip.
+
+The summary counts the scenes that show (動畫 N 段). A scene that does not show, or shows for less than
+scenes.MIN_SCENE_FRAMES, is a warning: its scene_warning (English, with its index) in the result for Claude, a
+sentence in Chinese that names it by its card and texts on the page and in storyboard.md.
 
 A candidate row shows what is cut (kind, reason, recognised text), whether edit.json accepts it,
 "不在成品裡" when it is not in the reel, the numbers of the list items about it, and a clip of the
@@ -55,6 +63,7 @@ import soundfile as sf
 
 from pipeline.captions import LONG_WORD_WARNING, Line, build_events
 from pipeline.edit import (
+    FPS,
     Segment,
     build_segments,
     kept_sentences,
@@ -65,6 +74,8 @@ from pipeline.edit import (
 from pipeline.errors import PipelineError
 from pipeline.media import run_ffmpeg
 from pipeline.project import Project, edit_stage, run_step
+from pipeline.punch import framings
+from pipeline.scenes import MIN_SCENE_FRAMES, Layout, scene_label, scene_layout, scene_warning
 from pipeline.review_items import TRIM_PAD_S, Item, review_items, trims_in_reel
 from pipeline.safe_delete import safe_rmtree
 from pipeline.style import font_path, load_style
@@ -101,7 +112,7 @@ _LONG_WORD_MARK = "有詞太長，從中間斷開"
 _NOT_IN_REEL = "不在成品裡"
 _NO_DECISIONS = "沒有要你決定的事。"
 _NO_LISTEN = "沒有其他要聽的地方。"
-_SENTENCE_COLUMNS = ("列", "縮圖", "新時間", "字幕", "語意", "標記")
+_SENTENCE_COLUMNS = ("列", "縮圖", "新時間", "字幕", "語意", "推近", "動畫", "標記")
 _TRIM_COLUMNS = ("編號", "種類", "原因", "辨識文字", "處理", "標記")
 _NEWLINES = re.compile(r"[\r\n\x0b\x0c\x85\u2028\u2029]+")
 
@@ -154,6 +165,8 @@ class _Sentence:
     sem: str = ""
     weight: str = ""
     note: str = ""  # the reason of the cuts.extra range that removes the sentence
+    framing: str = ""  # each shot punched in that starts in the sentence (_framing_text); empty when none does
+    animation: str = ""  # each scene that starts in the sentence (_animation_texts); empty when none does
     items: list[int] = field(default_factory=list)  # the numbers of the list items about it
     thumb_at: float | None = None  # source time of the thumbnail
     thumb: str = ""  # data URI, filled in by _Media
@@ -178,7 +191,10 @@ class _Plan:
     source_s: float
     duration_s: float
     cuts: int
-    warnings: list[str]  # the codes as the pipeline spells them; the page translates them
+    cut_points: int  # where the reel jumps: one less than its shots
+    punched: int  # the shots punched in (a scale over 1)
+    scenes: int  # the scenes that show
+    warnings: list[tuple[str, str]]  # (the code as the pipeline spells it, the text the page and storyboard.md show)
     decisions: list[_ListItem]
     listen: list[_ListItem]
     sentences: list[_Sentence]
@@ -268,8 +284,47 @@ def _list_items(items: list[Item], transcript: dict, segments: list[Segment], ca
     return shown
 
 
+def _framing_text(shots: list[tuple[float, float, float]], segments: list[Segment]) -> str:
+    """The shots punched in that start in a sentence (punch.framings), in order, each as its span in the reel and
+    its scale as edit.json has it (0:02.8 到 0:05.1 放大 1.1 倍), joined by 、. A shot can start in the middle of a
+    sentence and run on into the next ones, so its span is not the sentence's."""
+    return "、".join(f"{clock(map_time(start, segments))} 到 {clock(map_time(end, segments))} 放大 {scale} 倍"
+                    for start, end, scale in shots)
+
+
+def _animation_texts(layout: list[Layout]) -> dict[str, str]:
+    """Sentence id -> the scenes that show and start in it, in edit.json order, each as its card's name, its texts
+    and its span in the reel (數字卡：兩小時／一天多撐（0:12.0 到 0:14.5）), joined by 、."""
+    found: dict[str, list[str]] = {}
+    for item in layout:
+        if item.gone is None and item.frames > 0:
+            name, texts = scene_label(item.scene)
+            span = f"{clock(item.start / FPS)} 到 {clock((item.start + item.frames) / FPS)}"
+            found.setdefault(item.scene["at"]["s"], []).append(f"{name}：{texts}（{span}）")
+    return {sid: "、".join(texts) for sid, texts in found.items()}
+
+
+def _scene_warnings(layout: list[Layout]) -> list[tuple[str, str]]:
+    """(scene_warning, the same in Chinese) for each scene that has a warning."""
+    found = []
+    for item in layout:
+        code = scene_warning(item)
+        if code is None:
+            continue
+        name, texts = scene_label(item.scene)
+        if item.gone is not None:
+            text = f"動畫「{name}：{texts}」所在的句子整段移除了，這段動畫不會出現。"
+        elif item.frames == 0:
+            text = f"動畫「{name}：{texts}」的時間都被剪掉了，這段動畫不會出現。"
+        else:
+            text = f"動畫「{name}：{texts}」剪完只剩 {item.frames / FPS:.1f} 秒，不到 {MIN_SCENE_FRAMES / FPS:g} 秒。"
+        found.append((code, text))
+    return found
+
+
 def _sentence_rows(edit: dict, transcript: dict, segments: list[Segment], captions: dict[str, list[Line]],
-                   items: list[Item]) -> list[_Sentence]:
+                   items: list[Item], framed: dict[str, list[tuple[float, float, float]]],
+                   animations: dict[str, str]) -> list[_Sentence]:
     tags = {item["id"]: item for item in edit["sentences"]}
     notes = removal_notes(edit, transcript)
     about = _about(items, "sentence")
@@ -290,6 +345,8 @@ def _sentence_rows(edit: dict, transcript: dict, segments: list[Segment], captio
             long_word=any(line.split_word for line in captions[sid]),
             new_time=clock(map_time(sentence["start"], segments)),
             sem=tags[sid]["sem"], weight=tags[sid]["weight"],
+            framing=_framing_text(framed.get(sid, []), segments),
+            animation=animations.get(sid, ""),
             items=about.get(sid, []),
             thumb_at=middle,
         ))
@@ -326,17 +383,24 @@ def _plan(p: Project) -> _Plan:
     accepted = set(edit["cuts"]["accept"])
     long_word = any(line.split_word for lines in captions.values() for line in lines)
     notes = edit.get("notes", {})
+    framed = framings(edit, transcript, trims)
+    layout = scene_layout(edit, transcript, trims)
+    codes = list(probe.get("warnings") or []) + list(trims.get("warnings", [])) + (
+        [LONG_WORD_WARNING] if long_word else [])
     return _Plan(
         project=p.name,
         video=Path(probe["video_source"]),
         source_s=float(probe["duration_s"]),
         duration_s=total_duration(segments),
         cuts=len(accepted & inside) + len(edit["cuts"].get("extra", [])),
-        warnings=list(probe.get("warnings") or []) + list(trims.get("warnings", []))
-        + ([LONG_WORD_WARNING] if long_word else []),
+        cut_points=max(0, len(segments) - 1),
+        punched=sum(len(found) for found in framed.values()),
+        scenes=sum(1 for item in layout if item.gone is None and item.frames > 0),
+        warnings=[(code, _warning_text(code)) for code in codes] + _scene_warnings(layout),
         decisions=_list_items(decisions, transcript, segments, captions, notes),
         listen=_list_items(listen, transcript, segments, captions, notes),
-        sentences=_sentence_rows(edit, transcript, segments, captions, decisions + listen),
+        sentences=_sentence_rows(edit, transcript, segments, captions, decisions + listen, framed,
+                                 _animation_texts(layout)),
         trims=_trim_rows(trims, accepted, inside, decisions + listen),
     )
 
@@ -586,6 +650,8 @@ def _sentence_html(s: _Sentence) -> str:
         _td("新時間", _esc(s.new_time) or DASH, "time"),
         _td("字幕", shown, "captions"),
         _td("語意", meaning),
+        _td("推近", _esc(s.framing)),
+        _td("動畫", _esc(s.animation)),
         _td("標記", "；".join(marks), "marks"),
     ]
     return f'<tr data-sentence="{_esc(s.id)}"{row_class}>' + "".join(cells) + "</tr>"
@@ -616,9 +682,10 @@ def _table(css_class: str, headers: tuple[str, ...], rows: list[str]) -> str:
 
 
 def _figures(plan: _Plan) -> list[tuple[str, str]]:
-    """The summary: (label, value) for the source length, the new length, the pieces cut, the decisions
-    and the other places to listen to."""
+    """The summary: (label, value) for the source length, the new length, the pieces cut, the cut points and
+    the shots punched in, the scenes, the decisions and the other places to listen to."""
     return [("原長", clock(plan.source_s)), ("新長", clock(plan.duration_s)), ("剪掉", f"{plan.cuts} 段"),
+            ("推近", f"剪接點 {plan.cut_points} 個，放大 {plan.punched} 段"), ("動畫", f"{plan.scenes} 段"),
             ("要你決定", f"{len(plan.decisions)} 項"), ("其他要聽", f"{len(plan.listen)} 處")]
 
 
@@ -626,7 +693,7 @@ def _html(plan: _Plan) -> str:
     summary = "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in _figures(plan))
     warnings = ""
     if plan.warnings:
-        items = "".join(f"<li>{_esc(_warning_text(w))}</li>" for w in plan.warnings)
+        items = "".join(f"<li>{_esc(text)}</li>" for _, text in plan.warnings)
         warnings = f'\n<ul class="warnings">{items}</ul>'
     sentences = _table("sentences", _SENTENCE_COLUMNS, [_sentence_html(s) for s in plan.sentences])
     if plan.trims:
@@ -693,7 +760,7 @@ def _sentence_md(s: _Sentence) -> str:
         marks.append(_LONG_WORD_MARK)
     if s.items:
         marks.append(_see(s.items))
-    return _row([s.id, s.new_time, shown, meaning, "；".join(marks)])
+    return _row([s.id, s.new_time, shown, meaning, s.framing, _cell(s.animation), "；".join(marks)])
 
 
 def _trim_md(t: _Trim) -> str:
@@ -706,7 +773,7 @@ def _markdown(plan: _Plan) -> str:
     lines = [
         f"# 關卡 1 分鏡稿：{plan.project}", "",
         *(f"- {label}：{value}" for label, value in _figures(plan)),
-        *(f"- 警告：{_warning_text(w)}" for w in plan.warnings),
+        *(f"- 警告：{text}" for _, text in plan.warnings),
         "", "## 要你決定", "", *_list_md(plan.decisions, _NO_DECISIONS),
         "", "## 其他要聽的地方", "", *_list_md(plan.listen, _NO_LISTEN),
         "", "## 句子", "",
@@ -745,7 +812,7 @@ def _result(plan: _Plan, page_path: Path, md_path: Path) -> dict:
         "cuts": plan.cuts,
         "decisions": len(plan.decisions),
         "listen_points": len(plan.listen),
-        "warnings": plan.warnings,
+        "warnings": [code for code, _ in plan.warnings],
     }
 
 

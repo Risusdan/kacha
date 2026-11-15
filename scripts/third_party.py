@@ -4,7 +4,9 @@
     uv run python scripts/third_party.py --table
 
 Both start from `uv export --no-dev --no-hashes --format requirements-txt`, run from uv.lock alone
-(--frozen --offline), so they need neither the network nor the user's uv cache. The licence of every
+(--frozen --offline), so they need neither the network nor the user's uv cache. They then take the npm
+packages of the Remotion project, every package of scenes/package-lock.json but the project itself and dev
+packages, with the licence the lock records for each. The licence of every
 package is read from the metadata of the copy installed in the interpreter that runs this script:
 License-Expression, else the License field (when it names a licence and is not the whole text of one),
 else the License classifiers.
@@ -14,7 +16,9 @@ MPL-2.0, Unlicense, 0BSD, Zlib, HPND, LGPL). Any other package must have a row i
 dependency section of THIRD_PARTY.md for the installed version, whose 能否商業使用 column says 可, put there
 after somebody read the licence of that version on the official page. A row for another version of the
 package does not count: an upgrade can change the licence. --check lists every package that does not pass
-and exits with 1.
+and exits with 1. An npm package passes the same way; one whose lock entry has no licence passes only
+with such a row, and an optional one that is not installed under scenes/node_modules (a binary for another
+platform) is skipped with a note.
 
 --table prints the indirect dependencies as the Markdown table of that section. A package whose
 licence is off the allow list gets 待查 in the 能否商業使用 column, to be changed to 可 once it was checked.
@@ -23,6 +27,7 @@ licence is off the allow list gets 待查 in the 能否商業使用 column, to b
 import argparse
 import datetime
 import importlib.metadata
+import json
 import os
 import re
 import shutil
@@ -35,6 +40,8 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTER = ROOT / "THIRD_PARTY.md"
+NPM_LOCK = ROOT / "scenes" / "package-lock.json"
+NPM_USE = "Remotion 專案（scenes/）的 npm 套件"  # the 用途 cell of an npm package in --table
 
 INDIRECT_HEADING = "間接相依"  # the section of the register that --check reads and --table fills
 HEADER = "| 名稱 | 版本或來源 | 授權 | 能否商業使用 | 用途 | 查核日期 |"
@@ -71,6 +78,14 @@ class Requirement(NamedTuple):
     version: str
     marker: str  # the part after ";" in the export, "" when there is none
     via: tuple[str, ...]  # the packages that ask for it; "kacha" is this project
+
+
+class NpmPackage(NamedTuple):
+    name: str
+    version: str
+    licence: str  # "" when the lock records none
+    optional: bool
+    path: str  # the key of the package in the lock, e.g. node_modules/remotion
 
 
 def canonical(name: str) -> str:
@@ -242,6 +257,87 @@ def is_usable(cell: str) -> bool:
     return cell.startswith(USABLE)
 
 
+# ---- npm packages -----------------------------------------------------------------------------
+
+
+def npm_packages(lock: dict) -> list[NpmPackage]:
+    """The packages of a package-lock.json (lockfileVersion 2 or 3) in its order, but the project itself and the
+    packages only dev dependencies need."""
+    found = []
+    for path, info in lock.get("packages", {}).items():
+        if not path or info.get("dev"):
+            continue
+        name = info.get("name") or path.rsplit("node_modules/", 1)[-1]
+        found.append(NpmPackage(name, info.get("version", ""), (info.get("license") or "").strip(),
+                                bool(info.get("optional")), path))
+    return found
+
+
+def npm_installed(path: str) -> bool:
+    """Whether the package at `path` of the lock is installed under scenes/."""
+    return (NPM_LOCK.parent / path / "package.json").is_file()
+
+
+def _register_problem(label: str, name: str, version: str, rows: dict[str, list[tuple[str, str]]],
+                      missing: str) -> str | None:
+    """None when the register has a usable row for `name` at `version`; else what is wrong, `missing` when it has
+    no row of that name at all."""
+    listed = rows.get(canonical(name), [])
+    for_version = [cell for listed_version, cell in listed if listed_version == version]
+    if any(is_usable(cell) for cell in for_version):
+        return None
+    if listed and not for_version:
+        versions = ", ".join(dict.fromkeys(listed_version for listed_version, _ in listed))
+        return (f"{name} {version}: THIRD_PARTY.md lists it for version {versions}; "
+                f"read the licence of {version} on the official page and update the row")
+    return f"{label}: {missing}"
+
+
+def check_npm(packages: list[NpmPackage], installed: Callable[[str], bool],
+              rows: dict[str, list[tuple[str, str]]]) -> tuple[list[str], list[str]]:
+    """(problems, notes) for the npm packages, as check gives them for the Python ones."""
+    problems: list[str] = []
+    notes: list[str] = []
+    for package in packages:
+        label = f"{package.name} {package.version}"
+        if not installed(package.path):
+            if package.optional:
+                notes.append(f"{label}: skipped, an optional package not installed here (for another platform)")
+            else:
+                problems.append(f"{label}: not installed here (run npm ci in scenes/)")
+            continue
+        if package.licence and is_allowed(package.licence):
+            continue
+        missing = (
+            f"licence {package.licence!r} is not on the allow list and the indirect dependency table of "
+            f"THIRD_PARTY.md has no row for it that says {USABLE}; read the official page first"
+            if package.licence else
+            "no licence in scenes/package-lock.json; read the official page and list it in THIRD_PARTY.md"
+        )
+        problem = _register_problem(label, package.name, package.version, rows, missing)
+        if problem:
+            problems.append(problem)
+    return problems, notes
+
+
+def npm_table_rows(packages: list[NpmPackage], today: datetime.date) -> list[str]:
+    """The rows of the indirect dependency table for the npm packages."""
+    lines = []
+    for package in packages:
+        passed = bool(package.licence) and is_allowed(package.licence)
+        cells = [package.name, package.version, package.licence or NO_LICENCE, USABLE if passed else NOT_CHECKED,
+                 NPM_USE, today.isoformat()]
+        lines.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
+    return lines
+
+
+def read_npm_lock() -> list[NpmPackage]:
+    try:
+        return npm_packages(json.loads(NPM_LOCK.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        raise CheckError(f"cannot read {NPM_LOCK}: {getattr(error, 'strerror', None) or error}") from error
+
+
 # ---- the command's parts ----------------------------------------------------------------------
 
 
@@ -305,23 +401,13 @@ def check(
         if not claims:
             problems.append(f"{label}: no licence in its metadata; read the official page and list it in THIRD_PARTY.md")
         elif not all(is_allowed(claim) for claim in claims):
-            installed = meta["Version"] or requirement.version
-            listed = rows.get(canonical(requirement.name), [])
-            for_installed = [cell for version, cell in listed if version == installed]
-            if any(is_usable(cell) for cell in for_installed):
-                continue
-            if listed and not for_installed:
-                versions = ", ".join(dict.fromkeys(version for version, _ in listed))
-                problems.append(
-                    f"{requirement.name} {installed}: THIRD_PARTY.md lists it for version {versions}; "
-                    f"read the licence of {installed} on the official page and update the row"
-                )
-            else:
-                shown = "; ".join(claims)
-                problems.append(
-                    f"{label}: licence {shown!r} is not on the allow list and the indirect dependency table of "
-                    f"THIRD_PARTY.md has no row for it that says {USABLE}; read the official page first"
-                )
+            missing = (
+                f"licence {'; '.join(claims)!r} is not on the allow list and the indirect dependency table of "
+                f"THIRD_PARTY.md has no row for it that says {USABLE}; read the official page first"
+            )
+            problem = _register_problem(label, requirement.name, meta["Version"] or requirement.version, rows, missing)
+            if problem:
+                problems.append(problem)
     return problems, notes
 
 
@@ -354,12 +440,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         requirements = parse_requirements(export_requirements())
+        packages = read_npm_lock()
     except CheckError as error:
         print(f"error: {error}")
         return 1
 
     if args.table:
-        print(indirect_table(requirements, installed_metadata, direct_names(ROOT / "pyproject.toml"), datetime.date.today()))
+        today = datetime.date.today()
+        print(indirect_table(requirements, installed_metadata, direct_names(ROOT / "pyproject.toml"), today))
+        for line in npm_table_rows(packages, today):
+            print(line)
         return 0
 
     try:
@@ -368,14 +458,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read {REGISTER}: {error.strerror or error}")
         return 1
     problems, notes = check(requirements, installed_metadata, rows, marker_applies)
+    npm_problems, npm_notes = check_npm(packages, npm_installed, rows)
+    problems, notes = problems + npm_problems, notes + npm_notes
     for line in notes:
         print(f"note: {line}")
     if problems:
         for line in problems:
             print(f"FAIL {line}")
-        print(f"{len(problems)} of {len(requirements)} packages failed the licence check")
+        print(f"{len(problems)} of {len(requirements) + len(packages)} packages failed the licence check")
         return 1
-    print(f"OK: {len(requirements) - len(notes)} packages checked, all licences are usable")
+    print(f"OK: {len(requirements) + len(packages) - len(notes)} packages checked, all licences are usable")
     return 0
 
 

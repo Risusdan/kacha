@@ -205,15 +205,17 @@ def test_subcommand_help_returns_0(capsys):
     assert "usage" in capsys.readouterr().out
 
 
-def test_setup_reports_the_fonts_the_face_model_and_the_caption_dictionary(monkeypatch, capsys):
+def test_setup_reports_the_fonts_the_face_model_the_caption_dictionary_and_remotion(monkeypatch, capsys):
     folders = []
     monkeypatch.setattr("pipeline.cli.setup_fonts", lambda dest: [Path("fonts/regular.ttf"), Path("fonts/bold.ttf")])
     monkeypatch.setattr("pipeline.cli.setup_models", lambda dest: Path("models/face.onnx"))
     monkeypatch.setattr("pipeline.cli.setup_dictionary", lambda dest: folders.append(dest) or Path("models/dict.txt"))
+    monkeypatch.setattr("pipeline.cli.setup_scenes", lambda: {"remotion": True, "remotion_browser": False})
     assert main(["setup"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"ok": True, "fonts": [str(Path("fonts/regular.ttf")), str(Path("fonts/bold.ttf"))],
-                       "yunet": str(Path("models/face.onnx")), "dictionary": str(Path("models/dict.txt"))}
+                       "yunet": str(Path("models/face.onnx")), "dictionary": str(Path("models/dict.txt")),
+                       "remotion": True, "remotion_browser": False}
     assert folders == [models_dir()]
 
 

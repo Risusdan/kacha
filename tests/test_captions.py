@@ -147,10 +147,12 @@ def assert_parts_tile(lines: list[Line]) -> None:
 
 
 def best_breakings(text: str, ends: frozenset[int]) -> set[tuple[str, ...]]:
-    """The line texts of every best breaking of the one script sentence `text`, found by trying each set of
-    the places a line may break (words end at `ends`; every character boundary inside a stretch too wide
-    for a line), fewest breaks first: then the fewest short lines, the fewest breaks that are not
-    punctuation breaks, and the least sum of squared differences from the mean width."""
+    """The line texts of every best breaking of the one script sentence `text`. A line ends at every
+    punctuation break but one after 、 alone (one clause per caption); each clause between two such ends is
+    broken on its own, by trying each set of the places a line may break in it (words end at `ends`; every
+    character boundary inside a stretch too wide for a line), fewest breaks first: then the fewest short
+    lines, the fewest breaks that are not punctuation breaks, the fewest lines after the first that start
+    with a particle, and the least sum of squared differences from the mean width."""
     (sentence,), _ = parse_script(text)
     units = [{"text": u.text, "span": list(u.span)} for u in sentence.units]
     words = captions._tidy(captions._tokens(sentence.text, units))
@@ -167,24 +169,39 @@ def best_breakings(text: str, ends: frozenset[int]) -> set[tuple[str, ...]]:
             lo, hi = captions._shown_bounds(words[a:b])
             breaks.update(dict.fromkeys(range(starts[a + lo] + 1, starts[a + hi]), False))
 
+    def must_end(k: int) -> bool:
+        """Whether the punctuation break before words[k] ends a clause: a separator other than 、 in the
+        spaces and separators before it, or a ？ or ！ (with its marks and closing quotes) before those."""
+        while words[k - 1].kind in ("space", "sep"):
+            if words[k - 1].kind == "sep" and words[k - 1].piece.text != "、":
+                return True
+            k -= 1
+        return words[k - 1].kind in ("term", "close")
+
     def shown(part) -> str:
         return "".join(tok.piece.text for tok in captions._trim(part))
 
-    whole_is_short = width_units(shown(toks)) <= 2
-    for count in range(len(breaks) + 1):
-        found = []
-        for chosen in itertools.combinations(sorted(breaks), count):
-            bounds = [0, *chosen, len(toks)]
-            parts = [toks[a:b] for a, b in zip(bounds, bounds[1:])]
-            if not all(limits.fits(part) for part in parts):
-                continue
-            lines = tuple(shown(part) for part in parts)
-            short = 0 if whole_is_short else sum(width_units(line) <= 2 for line in lines)
-            found.append(((short, sum(not breaks[k] for k in chosen), squares(list(lines))), lines))
-        if found:
-            best = min(cost for cost, _ in found)
-            return {lines for cost, lines in found if cost[:2] == best[:2] and cost[2] <= best[2] + 1e-6}
-    raise AssertionError(f"no breaking of {text!r} fits")
+    def best_of(part: list, part_breaks: dict[int, bool]) -> list[tuple[str, ...]]:
+        for count in range(len(part_breaks) + 1):
+            found = []
+            for chosen in itertools.combinations(sorted(part_breaks), count):
+                bounds = [0, *chosen, len(part)]
+                pieces = [part[a:b] for a, b in zip(bounds, bounds[1:])]
+                if not all(limits.fits(piece) for piece in pieces):
+                    continue
+                lines = tuple(shown(piece) for piece in pieces)
+                short = sum(width_units(line) <= 2 for line in lines)  # a clause that short is one line
+                particle = sum(line[:1] in captions.PARTICLES for line in lines[1:])
+                found.append(((short, sum(not part_breaks[k] for k in chosen), particle, squares(list(lines))), lines))
+            if found:
+                best = min(cost for cost, _ in found)
+                return [lines for cost, lines in found if cost[:3] == best[:3] and cost[3] <= best[3] + 1e-6]
+        raise AssertionError(f"no breaking of {text!r} fits")
+
+    clause_ends = [starts[k] for k, punctuation in word_breaks.items() if punctuation and must_end(k)]
+    edges = [0, *sorted(clause_ends), len(toks)]
+    choices = [best_of(toks[a:b], {k - a: p for k, p in breaks.items() if a < k < b}) for a, b in zip(edges, edges[1:])]
+    return {tuple(line for lines in combination for line in lines) for combination in itertools.product(*choices)}
 
 
 # ---- line breaking ----------------------------------------------------------------------------
@@ -199,8 +216,52 @@ def test_long_sentence_breaks_at_comma():
         "第一步是把多餘的停頓剪掉", "這樣影片節奏才會變快很多"]
 
 
-def test_short_phrases_packed_with_ideographic_space():
-    assert [l.text for l in line_of("好，我們開始。")] == ["好　我們開始"]
+def test_a_caption_ends_at_every_comma_even_when_the_sentence_fits_one_line():
+    # one clause per caption: two clauses never share a line with a wide space between them
+    assert texts("今天來聊剪輯，也聊一下拍片技巧") == ["今天來聊剪輯", "也聊一下拍片技巧"]
+
+
+def test_a_short_clause_is_a_caption_of_its_own():
+    assert texts("好，我們開始。") == ["好", "我們開始"]
+    assert texts("好，對，沒錯") == ["好", "對", "沒錯"]
+
+
+@pytest.mark.parametrize("text, lines", [
+    ("先寫腳本。再開拍", ["先寫腳本", "再開拍"]),
+    ("先寫腳本；再開拍", ["先寫腳本", "再開拍"]),
+    ("重點：先寫腳本", ["重點", "先寫腳本"]),
+    ("真的嗎？我不信！好吧", ["真的嗎？", "我不信！", "好吧"]),
+    ("他說「真的嗎？」然後就走了", ["他說「真的嗎？」", "然後就走了"]),
+])
+def test_every_separator_and_question_or_exclamation_mark_ends_a_caption(text, lines):
+    assert [line.text for line in break_raw(text)] == lines
+
+
+def test_an_enumeration_comma_stays_inside_a_caption_as_written():
+    assert texts("亮度、背景更新、定位都會耗電") == ["亮度、背景更新、定位都會耗電"]
+    assert [line.text for line in break_raw("亮度、 背景更新")] == ["亮度、背景更新"]  # a run of 、 and spaces: one 、
+    assert [line.text for line in break_raw("亮度、，背景更新")] == ["亮度", "背景更新"]  # with another separator: an end
+
+
+def test_a_clause_too_wide_for_a_line_breaks_at_an_enumeration_comma_before_a_word_end(monkeypatch):
+    # a word ends between every two characters: the break after 、 still wins over the more even ones
+    monkeypatch.setattr("pipeline.captions.word_ends", everywhere)
+    assert texts("寫好腳本、還有拍攝前要準備的器材清單") == ["寫好腳本", "還有拍攝前要準備的器材清單"]
+
+
+def test_of_the_breaks_at_enumeration_commas_the_most_even_wins(monkeypatch):
+    monkeypatch.setattr("pipeline.captions.word_ends", everywhere)
+    assert texts("螢幕亮度、背景程式更新、還有定位服務") == ["螢幕亮度、背景程式更新", "還有定位服務"]
+
+
+def test_a_long_clause_is_cut_where_a_word_ends_into_captions_that_follow_one_another():
+    caption_dictionary()
+    text = "好，所以我覺得剪輯最重要的其實是整支影片的節奏"
+    lines = texts(text)
+    assert lines[0] == "好" and len(lines) == 3 and "".join(lines[1:]) == text[2:]
+    assert all(fits(line) for line in lines)
+    (sentence,), _ = parse_script(text)
+    assert 2 + len(lines[1]) in word_ends(sentence.text)
 
 
 def test_balanced_split_without_punct():
@@ -221,8 +282,8 @@ def test_line_limits_by_count_and_pixels():
         assert width_units(l.text) <= 16 and text_px(l.text, FONT, c["size_px"]) <= 950 - 2 * c["outline_px"]
 
 
-def test_inner_separators_become_ideographic_space():
-    assert texts("好、我們；開始：吧。") == ["好　我們　開始　吧"]
+def test_every_separator_but_the_enumeration_comma_ends_a_caption():
+    assert texts("好、我們；開始：吧。") == ["好、我們", "開始", "吧"]
 
 
 def test_question_exclamation_and_quotes_are_kept():
@@ -281,8 +342,9 @@ def test_a_single_star_underscore_or_tilde_is_text():
 
 def test_spaces_stay_single_and_never_touch_the_edges_or_a_separator():
     assert texts("我們用    Remotion \t 做動畫。") == ["我們用 Remotion 做動畫"]
-    assert texts("好， 我們開始") == ["好　我們開始"]
-    assert texts("好 ，我們開始") == ["好　我們開始"]
+    assert texts("好， 我們開始") == ["好", "我們開始"]
+    assert texts("好 ，我們開始") == ["好", "我們開始"]
+    assert texts("亮度 、 背景") == ["亮度、背景"]
     assert texts("他說 「好」") == ["他說 「好」"]
 
 
@@ -293,9 +355,8 @@ def test_nothing_is_left_at_the_ends_or_inside_the_marks():
 
 
 def test_pieces_carry_the_unit_index_and_none_for_punctuation():
-    (line,) = line_of("好，我們開始。")
-    assert [(p.text, p.unit) for p in line.pieces] == [
-        ("好", 0), ("　", None), ("我", 1), ("們", 2), ("開", 3), ("始", 4)]
+    (line,) = line_of("亮度、背景。")
+    assert [(p.text, p.unit) for p in line.pieces] == [("亮", 0), ("度", 1), ("、", None), ("背", 2), ("景", 3)]
 
 
 def test_a_latin_piece_keeps_its_written_case_and_space_pieces_have_no_unit():
@@ -396,12 +457,10 @@ def test_a_mark_with_no_partner_is_text():
     assert [line.text for line in break_raw("**")] == ["**"]
 
 
-def test_fewest_lines_first():
-    assert [l.text for l in line_of("今天來聊剪輯，也聊一下拍片技巧")] == ["今天來聊剪輯　也聊一下拍片技巧"]
-
-
-def test_a_punctuation_break_beats_a_word_break():
-    assert [l.text for l in line_of("第一步先把腳本寫好，再開始錄影跟剪輯影片")] == ["第一步先把腳本寫好", "再開始錄影跟剪輯影片"]
+def test_fewest_lines_first(monkeypatch):
+    # a clause of 20 characters: two lines, never three, however the words fall
+    monkeypatch.setattr("pipeline.captions.word_ends", everywhere)
+    assert len(texts("我們今天要來聊聊怎麼把一支影片剪得更好看")) == 2
 
 
 def breaks_in_text(text: str, lines: list[Line]) -> list[int]:
@@ -411,22 +470,17 @@ def breaks_in_text(text: str, lines: list[Line]) -> list[int]:
     return [sentence.units[unit].span[1] for unit in last_units]
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("好，這個方法我自己用了很久真的很有效。", ["好　這個方法我自己", "用了很久真的很有效"]),
-    ("這個方法我自己用了很久真的很有效，對。", ["這個方法我自己用了", "很久真的很有效　對"]),
-    ("好，我們今天來聊聊怎麼把一支影片剪好", ["好　我們今天來聊聊", "怎麼把一支影片剪好"]),
-])
-def test_a_line_of_one_or_two_characters_is_avoided_before_a_punctuation_break(text, expected):
-    # the fewest short lines come before the fewest breaks that are not punctuation breaks: a 好 or 對 on a
-    # line of its own is avoided by a break where a word ends
+@pytest.mark.parametrize("text", ["貓、狗還有其他寵物都可以一起帶來參加", "狗還有其他寵物都可以一起帶來參加、貓"])
+def test_a_line_of_one_or_two_characters_is_avoided_before_a_punctuation_break(text):
+    # the fewest short lines come before the fewest breaks that are not punctuation breaks: a 貓 on a line of
+    # its own, which the break at 、 would leave, is avoided by a break where a word ends
     caption_dictionary()
     lines = line_of(text)
     shown = [line.text for line in lines]
     assert len(shown) == 2 and all(width_units(line) > 2 and fits(line) for line in shown), shown
     (sentence,), _ = parse_script(text)
     for end in breaks_in_text(text, lines):
-        assert end in word_ends(sentence.text) or sentence.text[end] in "，。", (shown, end)
-    assert shown == expected
+        assert end in word_ends(sentence.text), (shown, end)
 
 
 def test_a_line_of_two_characters_is_avoided_when_another_break_ties_on_lines_and_punctuation(monkeypatch):
@@ -442,6 +496,44 @@ def test_a_line_of_two_characters_is_avoided_when_another_break_ties_on_lines_an
 def test_the_most_even_break_wins_the_rest(monkeypatch):
     monkeypatch.setattr("pipeline.captions.word_ends", lambda text: frozenset({4, 8, 13}))
     assert texts("我們今天要來聊聊怎麼把一支影片剪得更好看") == ["我們今天要來聊聊", "怎麼把一支影片剪得更好看"]
+
+
+def test_the_characters_a_line_had_rather_not_start_with():
+    assert captions.PARTICLES == frozenset("的地得了著們嗎呢吧啊呀啦喔哦嘛耶囉")
+
+
+# 最0近1很2多3人4問5我6用7的8是9哪10一11套12剪13輯14軟15體16: 17 characters, two lines
+ASKED = "最近很多人問我用的是哪一套剪輯軟體"
+
+
+def test_a_line_that_would_start_with_a_particle_gives_way_to_a_break_that_ties_before_it(monkeypatch):
+    # three word breaks, each two lines and one break that is not a punctuation break; before 的 gives the
+    # most even lines (8 and 9 characters), but a line that starts with 的 reads badly: one of the others
+    monkeypatch.setattr("pipeline.captions.word_ends", lambda text: frozenset({7, 8, 10}))
+    lines = texts(ASKED)
+    assert lines in (["最近很多人問我", "用的是哪一套剪輯軟體"], ["最近很多人問我用的是", "哪一套剪輯軟體"])
+    assert squares(["最近很多人問我用", "的是哪一套剪輯軟體"]) < squares(lines)
+
+
+def test_a_particle_the_dictionary_joins_to_the_next_character_still_counts(monkeypatch):
+    # 這0個1問2題3我4們5要6很7認8真9地10去11面12對13才14可15以16: 地去 is one word to the breaking, which
+    # the dictionary can give; the line would still start with 地
+    monkeypatch.setattr("pipeline.captions.word_ends", lambda text: frozenset({10, 12, 13}))
+    assert texts("這個問題我們要很認真地去面對才可以") == ["這個問題我們要很認真地去", "面對才可以"]
+
+
+def test_a_line_starts_with_a_particle_when_the_only_other_break_leaves_a_short_line(monkeypatch):
+    # breaking before 軟體 leaves a line two characters wide: the fewest short lines come first
+    monkeypatch.setattr("pipeline.captions.word_ends", lambda text: frozenset({8, 15}))
+    assert texts(ASKED) == ["最近很多人問我用", "的是哪一套剪輯軟體"]
+
+
+def test_a_punctuation_break_stays_when_the_line_after_it_starts_with_a_particle(monkeypatch):
+    # 最0重1要2的3是4持5續6發7文8跟9剪10輯11、12了13解14觀15眾16: the break at 、 leaves a line that starts
+    # with 了; the word breaks before 持 and 跟 do not, but they are breaks that are not punctuation breaks, and
+    # the fewest of those come first
+    monkeypatch.setattr("pipeline.captions.word_ends", lambda text: frozenset({5, 9}))
+    assert texts("最重要的是持續發文跟剪輯、了解觀眾") == ["最重要的是持續發文跟剪輯", "了解觀眾"]
 
 
 def test_lines_break_only_where_a_word_ends():
@@ -516,9 +608,20 @@ CROSS_CHECK = [
     "他說「這個方法真的可以省下一百五十分鐘，也能讓節奏變快很多嗎？」",
     "WWWW 這個網站 iiii 今年推出的新功能很好用，WWWW 真的很棒",
     "好，這個方法我自己用了很久真的很有效。",                                # a short line or a word break
+    "我覺得剪輯最重要的是節奏，然後字幕要放在大家都看得到的地方",              # lines that could start with 的
+    ASKED,
     SUPER + "這個字到底是什麼意思",                                         # a word wider than a line
     SUPER + "antidisestablishmentarianism" + "floccinaucinihilipilification" + "好",
+    "好，所以我覺得剪輯最重要的其實是整支影片的節奏",                        # a short clause, then a long one
+    "螢幕亮度、背景程式更新、還有定位服務",                                  # breaks at 、 inside one clause
+    "貓、狗還有其他寵物都可以一起帶來參加",
 ]
+
+
+def test_no_caption_shows_a_wide_space():
+    caption_dictionary()
+    for text in [*CROSS_CHECK, "好、我們；開始：吧。", "第一, 第二; 第三: 第四. 結束", "他說「好，我去」然後"]:
+        assert not any(captions.SEPARATOR in line for line in texts(text)), text
 
 
 @pytest.mark.parametrize("words", ["everywhere", "dictionary"])
@@ -534,14 +637,14 @@ def test_the_lines_are_the_best_of_every_breaking(monkeypatch, text, words):
 
 
 @pytest.mark.parametrize("text,lines", [
-    ("第一, 第二; 第三: 第四. 結束", ["第一　第二　第三　第四　結束"]),
+    ("第一, 第二; 第三: 第四. 結束", ["第一", "第二", "第三", "第四", "結束"]),
     ("價格是3.5元", ["價格是3.5元"]),
     ("用Node.js寫", ["用Node.js寫"]),
     ("然後呢...", ["然後呢..."]),
     ("花了1,000元", ["花了1,000元"]),
     ("差了1,5分", ["差了1,5分"]),
     ("早上10:30開始", ["早上10:30開始"]),
-    ("選A;B都可以", ["選A　B都可以"]),
+    ("選A;B都可以", ["選A", "B都可以"]),
     ("價格是１,０００元", ["價格是１,０００元"]),  # full-width digits and letters count as ASCII ones (NFKC)
     ("漲了３.５倍", ["漲了３.５倍"]),
     ("早上１０:３０開始", ["早上１０:３０開始"]),
@@ -606,25 +709,24 @@ def test_an_unspoken_sentence_gets_no_event(T, TR):
     T["sentences"][2]["spoken"] = False
     e["sentences"] = [s for s in e["sentences"] if s["id"] != "s03"]
     shown = [x.line.text for x in build_events(T, e, build_segments(e, T, TR), FONT, load_style())]
-    assert not any("150" in line for line in shown) and len(shown) == 3
+    assert not any("150" in line for line in shown) and len(shown) == 4  # s02 is two clauses
 
 
-def test_meijia_default_edit_gives_one_event_per_kept_sentence(T, TR):
+def test_meijia_default_edit_gives_one_event_per_clause_of_each_kept_sentence(T, TR):
     e = default_edit(T, TR); segs = build_segments(e, T, TR)
     ev = build_events(T, e, segs, FONT, load_style())
     assert [x.line.text for x in ev] == [
-        "今天我們來聊短影音剪輯", "第一步是把停頓剪掉　讓節奏變快", "這個方法可以省下 150 分鐘", "最後記得追蹤我"]
+        "今天我們來聊短影音剪輯", "第一步是把停頓剪掉", "讓節奏變快", "這個方法可以省下 150 分鐘", "最後記得追蹤我"]
     assert all(x.end > x.start for x in ev) and ev[-1].end <= total_duration(segs) + 1e-9
     assert missing_glyphs("".join(x.line.text for x in ev), FONT) == set()
 
 
 def test_event_start_end_and_piece_times_follow_the_units():
-    s = timed_sentence("s01", "好，我們開始。", [(1.0, 1.2), (1.2, 1.4), (1.4, 1.6), (1.6, 1.8), (1.8, 2.0)])
+    s = timed_sentence("s01", "亮度、背景。", [(1.0, 1.2), (1.2, 1.4), (1.4, 1.6), (1.6, 1.8)])
     (ev,) = reel([s], [Segment(0.0, 10.0)])
-    assert ev.start == pytest.approx(1.0) and ev.end == pytest.approx(2.0 + 0.5)
-    assert [p.text for p in ev.line.pieces] == ["好", "　", "我", "們", "開", "始"]
-    assert ev.times == [pytest.approx(1.0), None, pytest.approx(1.2), pytest.approx(1.4),
-                        pytest.approx(1.6), pytest.approx(1.8)]
+    assert ev.start == pytest.approx(1.0) and ev.end == pytest.approx(1.8 + 0.5)
+    assert [p.text for p in ev.line.pieces] == ["亮", "度", "、", "背", "景"]
+    assert ev.times == [pytest.approx(1.0), pytest.approx(1.2), None, pytest.approx(1.4), pytest.approx(1.6)]
 
 
 def test_an_event_ends_when_the_next_one_starts():
@@ -841,20 +943,23 @@ def test_punctuation_between_two_characters_of_one_unit_stays_in_it():
     assert times(r) == times(U)
 
 
-def test_a_character_typed_after_the_closing_full_stop_shows_after_an_ideographic_space():
-    """啦 joins the unit of 飯, whose span then holds the 。: the line shows it as a separator between two
-    tokens shows, not as written, and the unit keeps its index and its time."""
+def test_a_character_typed_after_the_closing_full_stop_is_a_caption_of_its_own():
+    """啦 joins the unit of 飯, whose span then holds the 。: the caption ends there as at a full stop between
+    two tokens. Each line shows its share of the unit's characters (飯　啦, the 。 shown as a separator between
+    two tokens is) at that share of the unit's time; the separator's share shows on no line."""
     old, new = "我們去吃飯。", "我們去吃飯。啦"
     spoken = [(1.0 + 0.3 * k, 1.25 + 0.3 * k) for k in range(5)]
     remapped = remap_units(old, units_of(old, [(k, k + 1) for k in range(5)]), new)
     assert shown(remapped)[-1] == ("飯。啦", [4, 7])  # the unit's text is the caption text's, as written
-    (line,) = break_lines(new, remapped, FONT, load_style())
-    assert line.text == "我們去吃飯" + captions.SEPARATOR + "啦" and "。" not in line.text
-    assert line.pieces[-1] == Piece("飯" + captions.SEPARATOR + "啦", 4)
+    first, second = break_lines(new, remapped, FONT, load_style())
+    assert [first.text, second.text] == ["我們去吃飯", "啦"]
+    assert first.pieces[-1] == Piece("飯", 4, (0.0, 1 / 3)) and second.pieces == [Piece("啦", 4, (2 / 3, 1.0))]
     s = timed_sentence("s01", old, spoken)
     edit = {"cuts": {"extra": []}, "captions": {"mode": "line", "text": {"s01": new}}}
-    (ev,) = build_events({"sentences": [s]}, edit, [Segment(0.0, 10.0)], FONT, load_style())
-    assert ev.line.text == "我們去吃飯　啦" and ev.times == [pytest.approx(t) for t, _ in spoken]
+    ev1, ev2 = build_events({"sentences": [s]}, edit, [Segment(0.0, 10.0)], FONT, load_style())
+    assert (ev1.line.text, ev2.line.text) == ("我們去吃飯", "啦")
+    assert ev1.times == [pytest.approx(t) for t, _ in spoken]
+    assert ev2.times == [pytest.approx(2.2 + 0.25 * 2 / 3)]
 
 
 @pytest.mark.parametrize("old, new", [("價格是一千元", "價格是１,０００元"), ("漲了三點五倍", "漲了３.５倍")])
@@ -864,10 +969,9 @@ def test_a_number_of_full_width_digits_in_a_caption_text_shows_as_written(old, n
 
 
 @pytest.mark.parametrize("text, line", [
-    ("吃飯。 啦好", "吃飯　啦好"),     # a run of a separator and a space: one ideographic space
-    ("吃飯，、啦好", "吃飯　啦好"),    # a run of separators: one
-    ("吃飯;啦好", "吃飯　啦好"),       # a half-width separator
     ("吃飯  啦好", "吃飯 啦好"),       # spaces only: one half-width space
+    ("吃飯、啦好", "吃飯、啦好"),      # 、 alone: as written
+    ("吃飯、 、啦好", "吃飯、啦好"),   # a run of 、 and spaces: one 、
     ("吃Node.js好", "吃Node.js好"),    # signs the sentence text shows as written stay so
     ("吃10:30好", "吃10:30好"),
     ("吃1,5好", "吃1,5好"),
@@ -882,6 +986,20 @@ def test_a_run_of_separators_and_spaces_inside_a_unit_shows_as_between_two_token
     (got,) = break_lines(text, units, FONT, load_style())
     assert got.text == line
     assert [(p.text, p.unit) for p in got.pieces] == [(text[0], 0), (line[1:-1], 1), (text[-1], 2)]
+
+
+@pytest.mark.parametrize("text", [
+    "吃飯。 啦好",   # a run of a separator and a space
+    "吃飯，、啦好",  # a run of separators, one of them other than 、
+    "吃飯;啦好",     # a half-width separator
+])
+def test_a_separator_inside_a_unit_ends_the_caption_as_one_between_two_tokens_does(text):
+    """The middle unit shows 飯　啦 (the run as one between two tokens): each line shows its share of the
+    unit's characters, and the separator's share shows on no line."""
+    units = units_of(text, [(0, 1), (1, len(text) - 1), (len(text) - 1, len(text))])  # the middle unit holds the run
+    lines = break_lines(text, units, FONT, load_style())
+    assert [[(p.text, p.unit, p.part) for p in line.pieces] for line in lines] == [
+        [("吃", 0, (0.0, 1.0)), ("飯", 1, (0.0, 1 / 3))], [("啦", 1, (2 / 3, 1.0)), ("好", 2, (0.0, 1.0))]]
 
 
 @pytest.mark.parametrize("blank", ["，", " "])
@@ -904,12 +1022,12 @@ def test_a_unit_too_wide_for_a_line_is_never_cut_to_a_line_that_starts_or_ends_w
 
 
 @pytest.mark.parametrize("blank, breaks_there", [("，", True), (" ", False)])
-def test_after_a_separator_inside_a_wide_unit_is_a_punctuation_break_and_after_a_space_a_plain_one(
+def test_after_a_separator_inside_a_wide_unit_a_caption_ends_and_after_a_space_the_break_is_a_plain_one(
     blank, breaks_there
 ):
-    """The blank stands well off the middle of a unit too wide for a line. After a separator the line breaks
-    there, as a punctuation break beats a more even one that is not; after a space the break is a plain one
-    like every other, and the most even of them is taken."""
+    """The blank stands well off the middle of a unit too wide for a line. After a separator the caption
+    ends there, as at any separator but 、; after a space the break is a plain one like every other, and the
+    most even of them is taken."""
     caption_dictionary()
     head, rest = "好這是一個非常長的句", "然後還有更多的字要顯示出來吧啊"  # 10 and 15 characters
     new = head + blank + rest
@@ -922,8 +1040,9 @@ def test_a_run_of_separators_inside_a_unit_runs_on_across_a_mark_left_out():
     new = "大概多成兩，**，**小時"  # once the marks are left out, 兩，，小時: one run
     remapped = remap_units(OLD, U, new)
     assert shown(remapped)[-1] == ("兩，**，**小時", [4, 13])
-    (line,) = break_lines(new, remapped, FONT, load_style())
-    assert line.text == "大概多成兩" + captions.SEPARATOR + "小時"
+    first, second = break_lines(new, remapped, FONT, load_style())
+    assert (first.text, second.text) == ("大概多成兩", "小時")
+    assert second.pieces == [Piece("小時", 3, (0.5, 1.0))]  # the unit shows 兩　小時: one separator, not two
 
 
 def test_a_longer_replacement_is_spread_over_the_old_units():
@@ -1104,11 +1223,11 @@ def test_build_events_shows_the_edited_text_at_the_spoken_times():
 def test_build_events_shows_the_edited_text_of_a_real_transcript(T, TR):
     e = default_edit(T, TR); segs = build_segments(e, T, TR)
     before = build_events(T, e, segs, FONT, load_style())
-    assert before[1].line.text == "第一步是把停頓剪掉　讓節奏變快"
+    assert (before[1].line.text, before[2].line.text) == ("第一步是把停頓剪掉", "讓節奏變快")
     e["captions"]["text"] = {"s02": "第一步是把停頓剪光，讓節奏變快"}
     after = build_events(T, e, segs, FONT, load_style())
     assert [x.line.text for x in after] == [
-        before[0].line.text, "第一步是把停頓剪光　讓節奏變快", before[2].line.text, before[3].line.text]
+        before[0].line.text, "第一步是把停頓剪光", "讓節奏變快", before[3].line.text, before[4].line.text]
     for old, new in zip(before, after):
         assert (new.start, new.end) == (old.start, old.end) and new.times == old.times
 

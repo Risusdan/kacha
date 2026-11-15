@@ -4,6 +4,7 @@ The script is a file under scripts/, not a package, so it is loaded by path."""
 
 import datetime
 import importlib.util
+import json
 import sys
 from email.message import Message
 from pathlib import Path
@@ -435,6 +436,10 @@ def wired(tp, tmp_path, monkeypatch):
     monkeypatch.setattr(tp, "installed_metadata", lambda name: packages.get(name))
     monkeypatch.setattr(tp, "marker_applies", always)
     monkeypatch.setattr(tp, "direct_names", lambda *_: {"good"})
+    lock = tmp_path / "package-lock.json"
+    lock.write_text(json.dumps({"lockfileVersion": 3, "packages": {"": {"name": "kacha-scenes"}}}), encoding="utf-8")
+    monkeypatch.setattr(tp, "NPM_LOCK", lock)
+    monkeypatch.setattr(tp, "npm_installed", lambda path: True)
     return register
 
 
@@ -479,3 +484,92 @@ def test_unreadable_register(tp, wired, tmp_path, monkeypatch, capsys):
     assert tp.main(["--check"]) == 1
     out = capsys.readouterr().out
     assert "cannot read" in out and str(missing) in out
+
+
+# ---- npm packages of scenes/ ------------------------------------------------------------------
+
+
+LOCK = {"lockfileVersion": 3, "packages": {
+    "": {"name": "kacha-scenes", "dependencies": {"remotion": "4.0.542"}},
+    "node_modules/remotion": {"version": "4.0.542", "license": "SEE LICENSE IN LICENSE.md"},
+    "node_modules/react": {"version": "19.3.1", "license": "MIT"},
+    "node_modules/@remotion/compositor-linux-x64-gnu": {"version": "4.0.542", "optional": True},
+    "node_modules/@remotion/media": {"version": "4.0.542"},
+    "node_modules/a/node_modules/react": {"version": "18.0.0", "license": "MIT"},
+    "node_modules/prettier": {"version": "3.8.1", "license": "MIT", "dev": True},
+}}
+
+
+def test_npm_packages_are_every_package_of_the_lock_but_the_project_and_dev_ones(tp):
+    assert tp.npm_packages(LOCK) == [
+        tp.NpmPackage("remotion", "4.0.542", "SEE LICENSE IN LICENSE.md", False, "node_modules/remotion"),
+        tp.NpmPackage("react", "19.3.1", "MIT", False, "node_modules/react"),
+        tp.NpmPackage("@remotion/compositor-linux-x64-gnu", "4.0.542", "", True,
+                      "node_modules/@remotion/compositor-linux-x64-gnu"),
+        tp.NpmPackage("@remotion/media", "4.0.542", "", False, "node_modules/@remotion/media"),
+        tp.NpmPackage("react", "18.0.0", "MIT", False, "node_modules/a/node_modules/react"),
+    ]
+
+
+def npm(tp, name, version="1.0", licence="MIT", optional=False):
+    return tp.NpmPackage(name, version, licence, optional, f"node_modules/{name}")
+
+
+def test_npm_check_passes_an_allowed_licence(tp):
+    assert tp.check_npm([npm(tp, "react")], lambda path: True, {}) == ([], [])
+
+
+def test_npm_check_wants_a_usable_row_for_the_version_of_a_licence_off_the_list(tp):
+    package = npm(tp, "@remotion/renderer", "4.0.542", "SEE LICENSE IN LICENSE.md")
+    problems, _ = tp.check_npm([package], lambda path: True, {})
+    assert len(problems) == 1 and "@remotion/renderer 4.0.542" in problems[0] and "SEE LICENSE IN LICENSE.md" in problems[0]
+    assert tp.check_npm([package], lambda path: True, register_with(tp, ("@remotion/renderer", "4.0.542", "可"))) == ([], [])
+    problems, _ = tp.check_npm([package], lambda path: True, register_with(tp, ("@remotion/renderer", "4.0.541", "可")))
+    assert problems == ["@remotion/renderer 4.0.542: THIRD_PARTY.md lists it for version 4.0.541; "
+                        "read the licence of 4.0.542 on the official page and update the row"]
+
+
+def test_npm_check_passes_a_package_without_a_licence_only_with_a_usable_row(tp):
+    package = npm(tp, "@remotion/media", "4.0.542", "")
+    problems, _ = tp.check_npm([package], lambda path: True, {})
+    assert problems == ["@remotion/media 4.0.542: no licence in scenes/package-lock.json; read the official page "
+                        "and list it in THIRD_PARTY.md"]
+    assert tp.check_npm([package], lambda path: True, register_with(tp, ("@remotion/media", "4.0.542", "可"))) == ([], [])
+
+
+def test_npm_check_skips_an_optional_package_that_is_not_installed_and_reports_a_required_one(tp):
+    optional = npm(tp, "@remotion/compositor-linux-x64-gnu", "4.0.542", "", optional=True)
+    required = npm(tp, "remotion", "4.0.542", "MIT")
+    problems, notes = tp.check_npm([optional, required], lambda path: False, {})
+    assert problems == ["remotion 4.0.542: not installed here (run npm ci in scenes/)"]
+    assert notes == ["@remotion/compositor-linux-x64-gnu 4.0.542: skipped, an optional package not installed here "
+                     "(for another platform)"]
+
+
+def test_check_command_checks_the_npm_lock_too(tp, wired, capsys, monkeypatch):
+    wired.write_text(wired.read_text(encoding="utf-8") + "| odd | 2.0 | CC0-1.0 | 可 |\n", encoding="utf-8")
+    tp.NPM_LOCK.write_text(json.dumps(LOCK), encoding="utf-8")
+    monkeypatch.setattr(tp, "npm_installed", lambda path: "compositor" not in path)
+    assert tp.main(["--check"]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL remotion 4.0.542" in out and "FAIL @remotion/media 4.0.542" in out and "react" not in out
+    rows = "| remotion | 4.0.542 | Remotion License | 可 |\n| @remotion/media | 4.0.542 | 未標示 | 可 |\n"
+    wired.write_text(wired.read_text(encoding="utf-8") + rows, encoding="utf-8")
+    assert tp.main(["--check"]) == 0
+    assert "OK: 6 packages checked" in capsys.readouterr().out
+
+
+def test_check_command_fails_without_the_npm_lock(tp, wired, capsys):
+    tp.NPM_LOCK.unlink()
+    assert tp.main(["--check"]) == 1
+    assert "package-lock.json" in capsys.readouterr().out
+
+
+def test_table_command_lists_the_npm_packages_after_the_python_ones(tp, wired, capsys):
+    tp.NPM_LOCK.write_text(json.dumps(LOCK), encoding="utf-8")
+    assert tp.main(["--table"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[2].startswith("| odd | 2.0 |")
+    assert lines[3].startswith("| remotion | 4.0.542 | SEE LICENSE IN LICENSE.md | 待查 | Remotion 專案（scenes/）的 npm 套件 |")
+    assert lines[4].startswith("| react | 19.3.1 | MIT | 可 |")
+    assert lines[5].startswith("| @remotion/compositor-linux-x64-gnu | 4.0.542 | 未標示 | 待查 |")

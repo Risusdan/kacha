@@ -1,0 +1,9 @@
+{
+  "keyword-pop": {"padding_x": 48, "grow": 1.04, "text": {"size": 80, "weight": "bold"}},
+  "number-slab": {
+    "padding_x": 64,
+    "value": {"size": 128, "weight": "bold"},
+    "label": {"size": 56, "weight": "regular"}
+  },
+  "bullet-list": {"padding_x": 56, "tick": 56, "tick_gap": 24, "items": {"size": 56, "weight": "regular"}}
+}

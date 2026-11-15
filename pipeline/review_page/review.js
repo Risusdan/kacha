@@ -9,7 +9,8 @@
 // reel, and the state with its step, error text and outputs, which the first view shows) and asks GET api/state
 // every POLL_MS. It plays the review video, which is the whole source, and skips what the edit cuts: on every frame
 // (requestVideoFrameCallback, on the time of the frame on screen, a frame ahead) and on every timeupdate it asks
-// skipTarget where to go. Every change goes to POST api/change with the version of the edit the page shows; the page
+// skipTarget where to go, and scales the video as the render frames the shot that plays (shotTransform: the punch-in;
+// the captions are drawn over it unscaled). Every change goes to POST api/change with the version of the edit the page shows; the page
 // then loads the data again. A version the page did not cause (Claude changed the edit from the chat) loads the data
 // again with a notice: pollVersion decides. While a change or the approval is on its way, the buttons that change
 // something are disabled and no poll goes out. Once the state is working, approved or done, the page shows that
@@ -31,8 +32,10 @@ import {
   playerClock,
   pollVersion,
   reelTime,
+  sceneAt,
   seekPoint,
   sentenceAt,
+  shotTransform,
   skipTarget,
   sourceTime,
 } from "./logic.js";
@@ -396,7 +399,16 @@ function tick(t = video.currentTime, ahead = 0) {
     page.stopAtReel = null;
     video.pause();
   }
+  // while it skips, the framing stays until a frame of the next shot shows; at the end it is the last shot's
+  if (target === null || target === -1) showFraming(t);
   showTime();
+}
+
+// The punch-in of the shot of the frame at source time `t` (shotTransform), on the video alone.
+function showFraming(t) {
+  const framing = shotTransform(t, page.data.shots);
+  video.style.transform = framing ? framing.transform : "";
+  video.style.transformOrigin = framing ? framing.origin : "";
 }
 
 function watchFrames() {
@@ -421,7 +433,17 @@ function showTime() {
   $("clock").textContent = `${playerClock(t, data.segments, data.duration_s, data.duration_clock)} / ${data.duration_clock}`;
   playhead.style.left = `${Math.min(100, (t / (data.source_s || 1)) * 100)}%`;
   showCaption(r);
+  showScene(t);
   showSentence(t);
+}
+
+// The label of the animation card that plays at source time `t` (sceneAt), over the top of the video; the page shows
+// where a card is and what it says, not the card itself.
+function showScene(t) {
+  const scene = sceneAt(t, page.data.scenes);
+  const label = $("scene");
+  label.textContent = scene ? scene.label : "";
+  label.hidden = !scene;
 }
 
 // The caption on screen at reel time `r`, in word mode with the spoken pieces in the highlight colour; over the

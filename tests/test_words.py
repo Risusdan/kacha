@@ -73,12 +73,13 @@ def listed_words() -> list[str]:
     return [line.strip() for line in words.WORDS_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-# Creator words the dictionary alone splits (短/影音, 互動/率, 限時/動態, 粉絲/專頁), each in a sentence of its own.
+# Words the dictionary alone splits (短/影音, 互動/率, 限時/動態, 粉絲/專頁, 不/一定), each in a sentence of its own.
 ADDED_WORDS = {
     "短影音": "我最近在做短影音的企劃",
     "互動率": "這篇貼文的互動率很高",
     "限時動態": "記得去看我的限時動態喔",
     "粉絲專頁": "歡迎追蹤我的粉絲專頁",
+    "不一定": "貴的器材不一定比較好",
 }
 
 

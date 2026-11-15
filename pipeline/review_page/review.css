@@ -89,6 +89,10 @@ button.pill { cursor: pointer; }
 .caption { position: absolute; left: 0; right: 0; top: 0; text-align: center; white-space: nowrap; pointer-events: none;
            font-family: "ReelCaption", sans-serif; font-weight: normal; font-synthesis: none; line-height: normal;
            paint-order: stroke fill; }
+.scene-label { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); max-width: calc(100% - 24px);
+               padding: 4px 10px; border-radius: 999px; background: rgba(29, 29, 31, 0.78); color: #fff;
+               font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.scene-label[hidden] { display: none; }
 .controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--sub); }
 .clock { font-variant-numeric: tabular-nums; }
 

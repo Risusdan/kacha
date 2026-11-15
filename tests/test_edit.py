@@ -28,7 +28,9 @@ from pipeline.edit import (
     load_document,
     load_edit,
     map_time,
+    punch_in_unused,
     require_valid,
+    segment_sentences,
     total_duration,
     validate_edit,
 )
@@ -102,24 +104,24 @@ def test_default_edit_is_valid(T, TR):
 
 
 def test_unknown_and_future_keys(T, TR):
-    e = default_edit(T, TR) | {"foo": 1, "scenes": []}
+    e = default_edit(T, TR) | {"foo": 1, "broll": []}
     errs = validate_edit(e, T, TR)
-    assert any(x.startswith("foo:") for x in errs) and any("scenes" in x and "phase 2" in x for x in errs)
+    assert any(x.startswith("foo:") for x in errs) and any("broll" in x and "phase 2" in x for x in errs)
 
 
-@pytest.mark.parametrize("key, phase", [("scenes", 2), ("broll", 2), ("punch_in", 2), ("sfx", 3), ("music", 3)])
+@pytest.mark.parametrize("key, phase", [("broll", 2), ("sfx", 3), ("music", 3)])
 def test_every_future_key_names_its_phase(T, TR, key, phase):
     errs = validate_edit(default_edit(T, TR) | {key: {}}, T, TR)
     assert errs == [f"{key}: not supported until phase {phase}"]
     assert FUTURE_KEYS[key] == phase
 
 
-def test_future_keys_are_exactly_the_five(T, TR):
-    assert FUTURE_KEYS == {"scenes": 2, "broll": 2, "punch_in": 2, "sfx": 3, "music": 3}
+def test_future_keys_are_exactly_the_three(T, TR):
+    assert FUTURE_KEYS == {"broll": 2, "sfx": 3, "music": 3}  # scenes came with phase 2 (pipeline.scenes)
 
 
 def test_the_optional_key_and_the_words_a_note_is_made_of():
-    assert OPTIONAL_KEYS == ("notes",)
+    assert OPTIONAL_KEYS == ("notes", "punch_in", "scenes")
     assert (NOTE_PREFIX, NOTE_REASON) == ("建議", "。因為")
 
 
@@ -556,7 +558,7 @@ def test_all_errors_are_reported_not_just_the_first(T, TR):
 
 
 def test_every_error_reads_path_colon_problem(T, TR):
-    e = default_edit(T, TR) | {"version": 3, "foo": 1, "scenes": []}
+    e = default_edit(T, TR) | {"version": 3, "foo": 1, "broll": []}
     e["cuts"]["accept"] = [1, "t99"]
     e["cuts"]["extra"] = [extra("s03", "s02"), "s01", {}]
     e["sentences"][0]["sem"] = "funny"
@@ -1170,7 +1172,7 @@ def test_require_valid_returns_edit_transcript_and_trims(trimmed_project):
 def test_require_valid_raises_with_every_error(trimmed_project):
     p = trimmed_project
     transcript, trims = _documents(p)
-    edit = default_edit(transcript, trims) | {"scenes": [], "version": 9}
+    edit = default_edit(transcript, trims) | {"broll": [], "version": 9}
     edit["captions"]["mode"] = "karaoke"
     _write_edit(p, edit)
     with pytest.raises(EditInvalid) as caught:
@@ -1398,3 +1400,96 @@ def test_validate_treats_a_malformed_record_like_a_missing_one(edited_project, c
     code, out = _validate(p, capsys)
     assert code == 0 and "warnings" not in out
     assert load_state(p)["edit_checked"] == _edit_checked(p)
+
+
+# ---- punch_in -------------------------------------------------------------------------------------
+
+
+def starts(edit: dict, transcript: dict, trims: dict) -> list[str]:
+    """The sentence each segment of the edit starts in."""
+    return segment_sentences(edit, transcript, trims, build_segments(edit, transcript, trims))
+
+
+def test_punch_in_sets_a_scale_from_1_to_1_2_for_a_sentence_a_shot_starts_in(T, TR):
+    e = default_edit(T, TR)
+    first = starts(e, T, TR)[0]
+    for scale in (1, 1.0, 1.1, 1.15, 1.2):
+        assert validate_edit({**e, "punch_in": {first: scale}}, T, TR) == [], scale
+    assert validate_edit({**e, "punch_in": {}}, T, TR) == []
+
+
+@pytest.mark.parametrize("value, problem", [
+    (0.9, "must be a number from 1 to 1.2, got 0.9"),
+    (1.25, "must be a number from 1 to 1.2, got 1.25"),
+    ("1.1", "must be a number from 1 to 1.2, got a string"),
+    (True, "must be a number from 1 to 1.2, got a boolean"),
+    (None, "must be a number from 1 to 1.2, got null"),
+])
+def test_punch_in_names_a_scale_that_is_not_a_number_from_1_to_1_2(T, TR, value, problem):
+    e = default_edit(T, TR)
+    first = starts(e, T, TR)[0]
+    assert validate_edit({**e, "punch_in": {first: value}}, T, TR) == [f"punch_in.{first}: {problem}"]
+
+
+def test_punch_in_names_a_sentence_that_is_not_spoken_or_unknown_and_keeps_one_cuts_extra_removes():
+    """An entry for a sentence cuts.extra removes is kept and changes nothing, as captions.text is: the review page
+    can remove the sentence, and restore it, without touching punch_in."""
+    T2, TR2 = transcript_and_trims(FOUR, asr="第一句話第三句話第四句話")
+    assert [s["id"] for s in T2["sentences"] if not s["spoken"]] == ["s02"]
+    e = default_edit(T2, TR2)
+    e["cuts"]["extra"] = [{"from": "s03", "to": "s03", "reason": "離題"}]
+    e["sentences"] = [s for s in e["sentences"] if s["id"] != "s03"]
+    e["punch_in"] = {"s02": 1.1, "s03": 1.1, "s99": 1.1}
+    assert validate_edit(e, T2, TR2) == [
+        "punch_in.s02: not a spoken sentence",
+        "punch_in.s99: not a spoken sentence",
+    ]
+    e["punch_in"] = {"s03": 1.1}
+    assert validate_edit(e, T2, TR2) == []
+    assert punch_in_unused(e, T2, TR2) == ["punch_in.s03: no shot starts in this sentence, so it changes nothing"]
+
+
+def test_punch_in_for_a_sentence_no_shot_starts_in_passes_and_is_named_as_unused():
+    """A sentence with no cut point: the entry changes nothing. It passes, so that a change of the cuts on the review
+    page that leaves a sentence without a cut point is not refused; validate warns of it."""
+    T2, TR2 = transcript_and_trims(THREE, asr="第一句話第二句話第三句話")
+    e = default_edit(T2, TR2)
+    begun = set(starts(e, T2, TR2))
+    idle = [s["id"] for s in T2["sentences"] if s["id"] not in begun]
+    assert idle, "the fixture needs a sentence no shot starts in"
+    e["punch_in"] = {idle[0]: 1.2, sorted(begun)[0]: 1}
+    assert validate_edit(e, T2, TR2) == []
+    assert punch_in_unused(e, T2, TR2) == [f"punch_in.{idle[0]}: no shot starts in this sentence, so it changes nothing"]
+    assert punch_in_unused(default_edit(T2, TR2), T2, TR2) == []
+
+
+def test_validate_warns_of_a_punch_in_that_changes_nothing(edited_project, capsys):
+    p = edited_project
+    edit = json.loads(p.edit_path.read_text(encoding="utf-8"))
+    edit["cuts"]["extra"] = [{"from": "s02", "to": "s02", "reason": "離題"}]
+    edit["sentences"] = [s for s in edit["sentences"] if s["id"] != "s02"]
+    edit["punch_in"] = {"s02": 1.2, "s03": 1}
+    _write_edit(p, edit)
+    code, out = _validate(p, capsys)
+    assert code == 0 and out["warnings"] == ["punch_in.s02: no shot starts in this sentence, so it changes nothing"]
+
+
+def test_validate_warns_of_a_scene_the_cuts_hide_after_the_punch_in_warnings(edited_project, capsys):
+    p = edited_project
+    edit = json.loads(p.edit_path.read_text(encoding="utf-8"))
+    edit["cuts"]["extra"] = [{"from": "s02", "to": "s02", "reason": "離題"}]
+    edit["sentences"] = [s for s in edit["sentences"] if s["id"] != "s02"]
+    edit["punch_in"] = {"s02": 1.2}
+    edit["scenes"] = [{"id": "sc1", "card": "keyword-pop", "at": {"s": "s02"}, "until": {"s": "s02", "end": True},
+                       "params": {"text": "省電"}}]
+    _write_edit(p, edit)
+    code, out = _validate(p, capsys)
+    assert code == 0 and out["warnings"] == [
+        "punch_in.s02: no shot starts in this sentence, so it changes nothing",
+        "scenes[0]: s02 is removed by cuts.extra, so it is not shown",
+    ]
+
+
+def test_punch_in_must_be_an_object(T, TR):
+    assert validate_edit({**default_edit(T, TR), "punch_in": [1.1]}, T, TR) == [
+        "punch_in: must be an object, got an array"]

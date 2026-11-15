@@ -127,6 +127,19 @@ def test_toggling_a_cut_writes_edit_json_and_records_validate(tmp_path, trim, cu
     assert edit_stage(p) is None  # validate_project recorded the new edit.json
 
 
+def test_a_change_that_leaves_a_punch_in_sentence_without_a_cut_point_is_applied(tmp_path):
+    """punch_in is Claude's and the page does not change it. A change of the cuts that leaves its sentence with no
+    cut point, or one that removes the sentence, is applied all the same: the entry stays and changes nothing.
+    (Keeping the filler t02 of s02 takes away the only cut point that starts a shot in s02.)"""
+    p, _, _ = project_for(tmp_path, mutate=lambda edit: edit.__setitem__("punch_in", {"s02": 1}))
+    apply_change(p, edit_version(p), change_cut("t02", False))
+    after = load_edit(p.edit_path)
+    assert "t02" in after["cuts"]["reject"] and after["punch_in"] == {"s02": 1}
+    apply_change(p, edit_version(p), change_remove("s02"))
+    after = load_edit(p.edit_path)
+    assert "s02" not in sentence_ids(after) and after["punch_in"] == {"s02": 1}
+
+
 def test_a_cut_that_is_already_so_changes_no_decision(tmp_path):
     p, _, _ = project_for(tmp_path)
     before = load_edit(p.edit_path)

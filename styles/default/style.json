@@ -19,5 +19,10 @@
     "max_lines": 2,
     "bottom_px": 1248,
     "hold_s": 0.5
+  },
+  "scenes": {
+    "zone": {"x0": 65, "x1": 1015, "y0": 269, "y1": 1040},
+    "colors": {"card": "#FFFFFF", "text": "#111111", "accent": "#FFD400", "muted": "#5C5C5C"},
+    "radius_px": 32
   }
 }

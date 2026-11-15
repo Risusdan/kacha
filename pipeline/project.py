@@ -36,10 +36,11 @@ from pipeline.safe_delete import safe_rmtree
 
 STATE_VERSION = 1
 # The version of what each of these steps makes: for transcribe and trim the format of the file it writes
-# (transcript.json, trim.json), for render what it does to the sound (2: the voice treatment of pipeline.voice).
+# (transcript.json, trim.json), for render what it does to the sound and the picture (2: the voice treatment of
+# pipeline.voice; 3: the punch-in of pipeline.punch).
 # run_step records it, and a record of another version (or of none, as earlier versions wrote them) is out of date:
 # the step runs again.
-FORMAT_VERSIONS: dict[str, int] = {"transcribe": 2, "trim": 2, "render": 2}
+FORMAT_VERSIONS: dict[str, int] = {"transcribe": 2, "trim": 2, "render": 3}
 GATES = ("gate1",)
 EARLY_STEPS = ("prep", "transcribe", "trim")  # in the order of the flow; the storyboard is built on their results
 _STATE_KEYS = ("source", "steps", "gates")

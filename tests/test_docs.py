@@ -14,6 +14,8 @@ from pipeline.captions import LONG_WORD_WARNING
 from pipeline.cli import registered_commands
 from pipeline.edit import UNCHANGED_EDIT_WARNING
 from pipeline.render import PREVIEW_OVER
+from pipeline.scene_render import NODE_MISSING
+from pipeline.scenes import CARDS
 from pipeline.storyboard import NOT_VALIDATED_REFUSAL, OLDER_FILES_REFUSAL
 from pipeline.trim import FEW_PAUSES_WARNING
 from pipeline.words import WORDS_FILE
@@ -24,6 +26,7 @@ FEATURE = ROOT / "FEATURE.md"
 BACKLOG = ROOT / "docs/backlog/2026-11-12-phase1-review-items.md"
 ORIGINAL_SPEC = ROOT / "docs/superpowers/specs/2026-11-11-reels-workflow-design.md"
 REVISION_SPEC = "docs/superpowers/specs/2026-11-12-phase1-revision-design.md"
+SCENES_SPEC = "docs/superpowers/specs/2026-11-15-remotion-foundation-design.md"
 # a sentence or candidate id (s05, t03) that stands alone or next to Chinese characters, not inside a longer word or number
 ID = re.compile(r"(?<![A-Za-z0-9])[st]\d{2}(?!\d)")
 FENCED = re.compile(r"```(?:text)?\n(.*?)```", re.S)
@@ -222,6 +225,48 @@ def test_feature_list_has_the_review_page_and_caption_editing():
     done = FEATURE.read_text(encoding="utf-8").split("## 待開發")[0]
     for words in ("審閱頁", "同意，輸出成品", "按「改字幕」", "Remote Control"):  # 「改字幕」: the caption bullet only
         assert words in done, words
+
+
+def test_storyboard_skill_explains_scenes_with_the_three_cards_and_what_validate_says():
+    text = DOCS[2].read_text(encoding="utf-8")
+    assert "## scenes：動畫" in text
+    keys = text.split("## 本期的鍵")[1].split("\n\n")[1]  # the paragraph on the keys of this phase
+    assert "`scenes`" in keys and "`scenes`、" not in keys  # allowed now, no longer a key of a later phase
+    assert "本期的成品沒有動畫" not in text
+    for card, (label, _, params) in CARDS.items():
+        assert f"`{card}`" in text and label in text, card
+        for param in params:
+            assert f"`{param.name}`" in text, (card, param.name)
+    for word in ("`at`", "`until`", "`char`", '"end": true', "`layout`", "overlaps", "in a row", "so it is not shown",
+                 "under 1 s", "the card font", "has no glyph for", "動畫」欄"):
+        assert word in text, word
+    section = text.split("## scenes：動畫")[1].split("\n## ")[0]
+    assert "只在使用者要的地方加" in section  # like punch-in, Claude adds no animation of its own
+
+
+def test_reel_skill_covers_what_the_animation_cards_need_and_say():
+    text = DOCS[1].read_text(encoding="utf-8")
+    assert "### 動畫" in text
+    for word in ("`node`", "`remotion`", "`remotion_browser`", "npm ci", "Node.js 18.18", "`scenes[",
+                 "the card font", "has no glyph for", NODE_MISSING, "scenes/node_modules", "the browser Remotion"):
+        assert word in text, word
+
+
+def test_claude_md_names_the_remotion_foundation_design_and_node():
+    text = DOCS[0].read_text(encoding="utf-8")
+    assert SCENES_SPEC in text and "Node.js" in text
+    assert "動畫還沒有" not in text
+
+
+def test_original_design_and_feature_list_point_at_the_animation_cards():
+    assert (ROOT / SCENES_SPEC).is_file()
+    section = ORIGINAL_SPEC.read_text(encoding="utf-8").split("### 8.5 場景渲染")[1].split("### 8.6")[0]
+    assert SCENES_SPEC in section
+    feature = FEATURE.read_text(encoding="utf-8")
+    done, todo = feature.split("## 待開發")
+    for label in ("重點字", "數字卡", "清單"):
+        assert label in done, label
+    assert "推近" in done and "畫面推近" not in todo
 
 
 def test_skills_have_frontmatter():

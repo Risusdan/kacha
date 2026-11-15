@@ -7,9 +7,12 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
 ## 它做的事
 
 - 找出可以剪的地方：贅字（嗯、呃）、重複的字詞、講錯重來的段落、太長的停頓。腳本裡沒有的話預設保留，由你決定剪不剪。
-- 字幕用你腳本裡的字，時間對到你的聲音。字幕是繁體中文，直接燒進畫面。
+- 字幕用你腳本裡的字，時間對到你的聲音。講的和腳本差太多的句子，字幕改用辨識出來的字，Claude 會請你檢查有沒有錯字。字幕是繁體中文，直接燒進畫面。
 - 審閱頁照剪好的樣子播放影片和字幕。你在頁面上決定每一段剪或留、改字幕的字，看完按同意，它就輸出成品。
+- 在你指定的地方，畫面可以放大，也可以放上動畫卡片：重點字、數字卡或清單。卡片在畫面上方，不會擋到字幕。
 - 成品是 1080×1920、每秒 30 格的 mp4，大小在 300 MB 以內。剪好的片長上限是 9 分 3 秒，超過時不會輸出。
+
+每一項功能，和在對話裡怎麼跟 Claude 說，見[功能一覽](docs/features.md)。
 
 ## 系統需求
 
@@ -21,7 +24,7 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
 | 可用硬碟空間 | 安裝前 30 GB 以上 | `df -h ~` 的 `Avail` 欄 | 先清出空間，再安裝。 |
 | Claude 帳號 | Pro、Max、Ultra、Team、Enterprise 或 Console 帳號。免費方案不能使用 Claude Code。 | 能在「Code」分頁和 Claude 對話，就符合。 | 先升級帳號的方案。 |
 
-安裝前要有 30 GB 可用空間：安裝用掉約 10 GB；輸出成品時，硬碟還要有 15 GB 以上可用；其餘留給影片和專案。可用空間不到 15 GB 時，Kacha 不輸出成品，要先清出空間。
+安裝前要有 30 GB 可用空間：安裝用掉約 11 GB；輸出成品時，硬碟還要有 15 GB 以上可用；其餘留給影片和專案。可用空間不到 15 GB 時，Kacha 不輸出成品，要先清出空間。
 
 ## 安裝
 
@@ -56,7 +59,7 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
 3. **讓指令找得到 Homebrew。** 執行 `command -v brew`。如果找不到：
    - 在 `~/.zprofile` 最後加一行 `eval "$(/opt/homebrew/bin/brew shellenv)"`。之後的對話就找得到 `brew`。
    - 這次安裝剩下的每個指令，前面都加上 `eval "$(/opt/homebrew/bin/brew shellenv)" &&`。
-4. **安裝 git、uv 和 ffmpeg-full。** 執行 `brew install git uv ffmpeg-full`。uv 管理 Kacha 用的 Python 和套件；ffmpeg-full 處理影片和聲音。
+4. **安裝 git、uv、ffmpeg-full 和 node。** 執行 `brew install git uv ffmpeg-full node`。uv 管理 Kacha 用的 Python 和套件；ffmpeg-full 處理影片和聲音；node 是 Node.js，用來做動畫卡片。
 5. **下載 Kacha。** 在使用者選的資料夾裡執行 `git clone https://github.com/Risusdan/kacha.git`。它建立 `kacha` 資料夾，下面的指令都在這個資料夾裡執行。
    - 已經有 `kacha` 資料夾時，不要覆蓋它。執行 `git -C kacha remote get-url origin`：印出的是上面的網址，就在 `kacha` 資料夾裡執行 `git pull`；不是的話，停下來問使用者。
 6. **安裝 Kacha 用的程式和模型。** 依序執行：
@@ -69,7 +72,7 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
    uv run hf download Qwen/Qwen3-ForcedAligner-0.6B
    ```
 
-   - `pipeline setup` 下載字幕字型，以及剪片要用的模型和字典。
+   - `pipeline setup` 下載字幕字型，以及剪片要用的模型和字典。它也安裝做動畫卡片用的 Remotion，並下載 Remotion 用的瀏覽器（約 459 MB）。
    - `hf` 是 `uv sync` 裝好的下載工具。三個 `hf download` 把語音辨識模型下載到 Hugging Face 的快取資料夾，共約 8.4 GB，不需要 Hugging Face 帳號。剪片時不會自動下載它們，所以要先下載。平常用 1.7B 模型辨識，它執行失敗時改用 0.6B；ForcedAligner 找出每個字的時間。
    - 這三個下載要很久。放在背景執行，期間告訴使用者還在下載。下載中斷時，再執行一次同一個指令。
 7. **檢查環境。** 執行 `uv run pipeline doctor`，它印出一行 JSON。
@@ -79,7 +82,7 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
    - 把影片和腳本放進這個資料夾。
    - 以後剪片時，在「Code」分頁選「文件」裡的 `kacha` 資料夾，說「剪 inbox 裡的○○那支」。
 
-使用者要更新 Kacha 時，在 `kacha` 資料夾裡執行 `git pull` 和 `uv sync`，再執行 `uv run pipeline doctor`。
+使用者要更新 Kacha 時，在 `kacha` 資料夾裡執行 `git pull` 和 `uv sync`，再執行 `uv run pipeline setup` 和 `uv run pipeline doctor`。`setup` 只下載還沒有的東西。`setup` 說找不到 node 時，執行 `brew install node`，再執行一次 `setup`。
 
 ## 剪一支影片
 
@@ -94,7 +97,9 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
    - 切換一段剪掉或保留，影片馬上照新的決定播。
    - 要改字幕的字，按「改字幕」。
 
-   想用講的，也可以在對話裡跟 Claude 說，例如「0:42 那段留著」或「1:48 那句字幕改成…」。頁面會在幾秒內跟著更新。
+   想用講的，也可以在對話裡跟 Claude 說，例如「0:42 那段留著」或「1:48 那句字幕改成…」。頁面會在幾秒內跟著更新。這些時間是審閱頁上的時間，也就是剪好的影片裡的時間。
+
+   要放大畫面或放動畫卡片，在對話裡跟 Claude 說，例如「0:12 那句放大」或「0:30 那句放數字卡」。放大預設是 1.1 倍，最多 1.2 倍。卡片上的字由 Claude 從那一句摘出來，它會先告訴你寫什麼、從幾秒到幾秒。要改卡片上的字或拿掉卡片，也在對話裡說。審閱頁播到那一段時，會在影片上方標出卡片的名稱和上面的字；動畫本身在成品裡才看得到。
 5. 看完按「同意，輸出成品」，再按「確定，輸出成品」。在對話裡回「可以」也算同意。成品 `final.mp4` 輸出完成後，頁面會播放預覽版，也有按鈕可以打開成品所在的資料夾。預覽版 `preview.mp4` 檔案較小，方便傳到手機上看，畫質不夠發布。
 
 你同意之後，如果又改了任何地方，要再同意一次，才會輸出新的成品。審閱頁關掉 30 分鐘後會自己停止；要再看，請 Claude 重新打開。
@@ -113,3 +118,11 @@ Claude Code 是 Anthropic 的 AI 助手，能在你的電腦上執行指令、�
 ## 授權
 
 Kacha 以 Apache License 2.0 授權，全文見 [LICENSE](LICENSE)。用到的第三方程式庫、模型、字型和工具，授權列在 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+Kacha 用 Remotion 做動畫。Remotion 有自己的授權（Remotion License），使用 Kacha 也要符合它的條件：
+
+- 個人、員工 3 人以下的營利組織、非營利組織：可以免費使用，包含商業用途。
+- 員工超過 3 人的營利組織：要向 Remotion 買公司授權（Company License），價格見 <https://www.remotion.pro/license>。
+- 不可以複製或修改 Remotion 的程式碼，做成自己的版本販售、出租或再授權。
+
+授權全文在安裝後的 `scenes/node_modules/remotion/LICENSE.md`。

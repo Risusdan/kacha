@@ -5,9 +5,10 @@ is the gate between that file and the render: it lists every problem it finds, e
 "<JSON path>: <problem>" (cuts.accept[2], sentences[1].sem, captions.mode), and never raises on a
 value of the wrong type. An error is one line: a value or key it quotes is shown as its repr, cut
 after SHOWN_CHARS characters, and a key that is not a plain word goes into the path as edit['a b']. A
-key an object writes twice is an error too (the parser alone would let the last one win). Phase 1
-knows the keys version, style, cuts, sentences and captions, and the optional key notes (a suggestion
-for a trim or a spoken sentence); the keys of later phases are refused with the phase that brings them.
+key an object writes twice is an error too (the parser alone would let the last one win). The keys
+version, style, cuts, sentences and captions are required; notes (a suggestion for a trim or a spoken
+sentence), punch_in and scenes (the animation cards, see pipeline.scenes) are optional; the keys of later
+phases are refused with the phase that brings them.
 captions takes the mode and the optional key text: for a spoken sentence, the one line of text, with a
 character that shows, its captions show in place of the sentence's own (see captions.caption_source).
 
@@ -45,10 +46,10 @@ WEIGHTS = ("main", "sub")
 CAPTION_MODES = ("line", "word")
 LINE_BREAK_CHARS = "\n\r\x0b\x0c\x85\u2028\u2029"  # a caption text holds none of these (captions makes them spaces)
 TOP_KEYS = ("version", "style", "cuts", "sentences", "captions")
-OPTIONAL_KEYS = ("notes",)  # top-level keys an edit may leave out
+OPTIONAL_KEYS = ("notes", "punch_in", "scenes")  # top-level keys an edit may leave out
 NOTE_PREFIX = "建議"  # a note starts with this, then says what the director suggests
 NOTE_REASON = "。因為"  # and a note contains this, which opens the reason
-FUTURE_KEYS = {"scenes": 2, "broll": 2, "punch_in": 2, "sfx": 3, "music": 3}  # key -> phase that adds it
+FUTURE_KEYS = {"broll": 2, "sfx": 3, "music": 3}  # key -> phase that adds it
 
 SHOWN_CHARS = 60  # a value or a key goes into an error as its repr, cut after this many characters
 
@@ -205,7 +206,9 @@ def validate_project(p: Project) -> dict:
     A pass is recorded in state.json as edit_checked: the sha256 of edit.json, transcript.json and
     trim.json, which next_step and the storyboard compare with the files they find. A failure records
     nothing. When the pass before this one was on this same edit.json but on another transcript.json or
-    trim.json, the result also has a `warnings` list that says so: the ids in it were not re-checked."""
+    trim.json, the result also has a `warnings` list that says so: the ids in it were not re-checked; a punch_in
+    entry that changes nothing (punch_in_unused) is a warning there too, after that one, and so is what the cuts do
+    to a scene (scenes.scene_warnings), after those."""
     hashes = edit_file_hashes(p)  # before the files are read: one that changes meanwhile fails the next comparison
     edit, transcript, trims = require_valid(p)
     segments = build_segments(edit, transcript, trims)
@@ -215,12 +218,17 @@ def validate_project(p: Project) -> dict:
         "kept_sentences": len(kept_sentences(edit, transcript)),
     }
     before = record_edit_checked(p, hashes)
+    from pipeline.scenes import scene_warnings  # scenes imports this module
+
+    warnings = punch_in_unused(edit, transcript, trims) + scene_warnings(edit, transcript, trims)
     if (
         before is not None
         and before["edit"] == hashes["edit"]
         and (before["transcript"], before["trim"]) != (hashes["transcript"], hashes["trim"])
     ):
-        result["warnings"] = [UNCHANGED_EDIT_WARNING]
+        warnings.insert(0, UNCHANGED_EDIT_WARNING)
+    if warnings:
+        result["warnings"] = warnings
     return result
 
 
@@ -267,7 +275,7 @@ def validate_edit(edit: dict, transcript: dict, trims: dict) -> list[str]:
     """Every problem of `edit` against the transcript and the trims, as "<JSON path>: <problem>". An
     empty list means the edit may go on to the render. Checks the phase-1 keys, rule 1 (every trim
     decided once, extra ranges, the sentence list, the value sets) and rule 7 (the sem tags), and the
-    caption texts and the notes when there are any."""
+    caption texts, the notes, punch_in and scenes (scenes.check_scenes) when there are any."""
     if not isinstance(edit, dict):
         return [f"edit: must be an object, got {_describe(edit)}"]
     errors: list[str] = []
@@ -283,7 +291,7 @@ def validate_edit(edit: dict, transcript: dict, trims: dict) -> list[str]:
             errors.append(f"{key}: missing")
 
     _check_version(edit, errors)
-    _check_style(edit, errors)
+    style = _check_style(edit, errors)
     ranges: list[tuple[str, str]] = []
     if "cuts" in edit and _is_object(edit["cuts"], "cuts", errors):
         ranges = _check_cuts(edit["cuts"], table, trims, errors)
@@ -298,9 +306,43 @@ def validate_edit(edit: dict, transcript: dict, trims: dict) -> list[str]:
             _check_caption_text(edit["captions"]["text"], transcript, table, errors)
     if "notes" in edit and _is_object(edit["notes"], "notes", errors):
         _check_notes(edit["notes"], table, trims, errors)
+    punch_in = "punch_in" in edit and _is_object(edit["punch_in"], "punch_in", errors)
+    if punch_in:
+        _check_punch_in(edit["punch_in"], table, ranges, errors)
+    if "scenes" in edit:
+        from pipeline.scenes import check_scenes  # scenes imports this module
+
+        check_scenes(edit["scenes"], transcript, errors, style)
     bounds_ok = _check_cut_points(transcript, trims, errors)
     _check_something_is_left(edit, transcript, trims, kept, bounds_ok, errors)
     return errors
+
+
+def _check_punch_in(scales: dict, table: Table, ranges: list[tuple[str, str]], errors: list[str]) -> None:
+    """Each punch_in entry belongs to a spoken sentence and is a number from 1 to punch.MAX_SCALE (a boolean is no
+    number). An entry for a sentence cuts.extra removes, or one no shot starts in, is kept and changes nothing
+    (punch_in_unused names it), as captions.text of a removed sentence is: a change of the cuts on the review page,
+    which does not touch punch_in, is never refused for it."""
+    from pipeline.punch import MAX_SCALE  # punch imports this module
+
+    for key, scale in scales.items():
+        path = _join("punch_in", str(key))
+        if not (key in table and table[key][1]):
+            errors.append(f"{path}: not a spoken sentence")
+        elif isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            errors.append(f"{path}: must be a number from 1 to {MAX_SCALE}, got {_describe(scale)}")
+        elif not 1 <= scale <= MAX_SCALE:
+            errors.append(f"{path}: must be a number from 1 to {MAX_SCALE}, got {_show(scale)}")
+
+
+def punch_in_unused(edit: dict, transcript: dict, trims: dict) -> list[str]:
+    """For a valid edit, the punch_in entries that change nothing, as warnings: no shot starts in their sentence
+    (segment_sentences), because it has no cut point or cuts.extra removes it."""
+    if not edit.get("punch_in"):
+        return []
+    begun = set(segment_sentences(edit, transcript, trims, build_segments(edit, transcript, trims)))
+    return [f"{_join('punch_in', str(key))}: no shot starts in this sentence, so it changes nothing"
+            for key in edit["punch_in"] if key not in begun]
 
 
 def _check_version(edit: dict, errors: list[str]) -> None:
@@ -343,15 +385,17 @@ def _check_caption_text(texts: dict, transcript: dict, table: Table, errors: lis
             errors.append(f"{path}: must have a character to show")
 
 
-def _check_style(edit: dict, errors: list[str]) -> None:
+def _check_style(edit: dict, errors: list[str]) -> dict | None:
+    """The edit's style as load_style gives it, or None after saying what is wrong (nothing when there is no
+    style key, which is reported as missing)."""
     if "style" not in edit:
-        return
+        return None
     name = edit["style"]
     if not isinstance(name, str):
         errors.append(f"style: must be a style name (a string), got {_describe(name)}")
-        return
+        return None
     try:
-        load_style(name)
+        return load_style(name)
     except UnknownStyle:  # there is no such style folder
         errors.append(f"style: unknown style {_show(name)}")
     except PipelineError as error:  # the folder is there and load_style refuses what is in it: say what
@@ -359,6 +403,7 @@ def _check_style(edit: dict, errors: list[str]) -> None:
     except (OSError, ValueError) as error:
         reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
         errors.append(f"style: cannot read style {_show(name)}: {reason}")
+    return None
 
 
 def _check_cuts(cuts: dict, table: Table, trims: dict, errors: list[str]) -> list[tuple[str, str]]:
@@ -586,6 +631,15 @@ def build_segments(edit: dict, transcript: dict, trims: dict) -> list[Segment]:
     if cursor < last:
         pieces.append((cursor, last))
     return [Segment(a / FPS, b / FPS) for a, b in pieces if b - a >= MIN_SEGMENT_FRAMES]
+
+
+def segment_sentences(edit: dict, transcript: dict, trims: dict, segments: list[Segment]) -> list[str]:
+    """The kept sentence each of `segments` starts in: the first kept sentence whose cut_out (trim.json bounds,
+    on the frame grid) is after the segment's first frame. That is the sentence whose cut points hold the frame,
+    or, for a frame in the gap between two sentences, the next one. Needs a valid edit."""
+    kept = kept_sentences(edit, transcript)
+    ends = [(sid, to_frame(trims["bounds"][sid]["cut_out"])) for sid in kept]
+    return [next((sid for sid, end in ends if to_frame(segment.start) < end), kept[-1]) for segment in segments]
 
 
 def total_duration(segments: list[Segment]) -> float:

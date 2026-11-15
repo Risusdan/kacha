@@ -22,6 +22,18 @@
 | jieba | 0.42.1（pyproject 固定） | MIT（儲存庫的 LICENSE，Copyright (c) 2013 Sun Junyi；已安裝套件的 metadata 也標示 MIT） | 可 | 把繁體中文字幕斷成詞，字幕斷行只在詞和詞之間 | 2026-11-12 |
 | pytest | 9.2.0 | MIT | 可 | 跑測試（只在開發時用） | 2026-11-11 |
 
+### npm 套件
+
+`scenes/package.json` 列出的套件，用來做動畫卡片。版本是 `scenes/package-lock.json` 鎖定的版本，`npm ci` 照這個檔案安裝。Remotion 授權（Remotion License）的條件見下方「人工確認的依據」。
+
+| 名稱 | 版本或來源 | 授權 | 能否商業使用 | 用途 | 查核日期 |
+|---|---|---|---|---|---|
+| remotion | 4.0.542（package.json 固定） | Remotion License | 可（個人、員工 3 人以下的營利組織、非營利組織；更大的營利組織要買 Remotion 的公司授權） | 動畫卡片的元件和時間軸 | 2026-11-15 |
+| @remotion/bundler | 4.0.542（package.json 固定） | Remotion License | 可（條件同上） | 把動畫卡片打包成網頁 | 2026-11-15 |
+| @remotion/renderer | 4.0.542（package.json 固定） | Remotion License | 可（條件同上） | 用瀏覽器把動畫卡片畫成透明背景的影片 | 2026-11-15 |
+| react | 19.3.1（package.json 固定） | MIT | 可 | 寫動畫卡片的畫面 | 2026-11-15 |
+| react-dom | 19.3.1（package.json 固定） | MIT | 可 | 寫動畫卡片的畫面 | 2026-11-15 |
+
 ### 模型
 
 模型檔不放在 repo 裡。Qwen3 的三個模型要事先放在本機的 Hugging Face 快取裡：`pipeline` 跑語音辨識時設成離線，不會下載它們，`uv run pipeline doctor` 檢查它們在不在。YuNet 和下一節的字幕斷行字典，由 `uv run pipeline setup` 下載到 `models/`。
@@ -31,7 +43,7 @@
 | Qwen3-ASR-1.7B | Hugging Face `Qwen/Qwen3-ASR-1.7B` | Apache-2.0 | 可 | 語音辨識（預設） | 2026-11-11 |
 | Qwen3-ASR-0.6B | Hugging Face `Qwen/Qwen3-ASR-0.6B` | Apache-2.0 | 可 | 語音辨識（1.7B 執行失敗時的備案） | 2026-11-11 |
 | Qwen3-ForcedAligner-0.6B | Hugging Face `Qwen/Qwen3-ForcedAligner-0.6B` | Apache-2.0 | 可 | 取得每個字的時間戳 | 2026-11-11 |
-| YuNet | `face_detection_yunet_2023mar.onnx`，opencv_zoo 的 `models/face_detection_yunet`（commit f12e127） | MIT（資料夾內的 LICENSE，Copyright (c) 2020 Shiqi Yu）；上游 libfacedetection.train 為 BSD-3-Clause | 可 | 偵測臉的位置（第 2 期的畫面推近要用） | 2026-11-11 |
+| YuNet | `face_detection_yunet_2023mar.onnx`，opencv_zoo 的 `models/face_detection_yunet`（commit f12e127） | MIT（資料夾內的 LICENSE，Copyright (c) 2020 Shiqi Yu）；上游 libfacedetection.train 為 BSD-3-Clause | 可 | 偵測臉的位置（畫面推近的錨點） | 2026-11-11 |
 
 ### 字典
 
@@ -52,6 +64,7 @@
 | 名稱 | 版本或來源 | 授權 | 能否商業使用 | 用途 | 查核日期 |
 |---|---|---|---|---|---|
 | ffmpeg-full | Homebrew 的 `ffmpeg-full` 9.0.2 | GPL-3.0 以上 | 可（當工具用，輸出的影片不受 GPL 約束） | 剪接、燒字幕、編碼 | 2026-11-11 |
+| Chrome Headless Shell | 158.0.8127.2，`@remotion/renderer` 4.0.542 下載到 `scenes/node_modules/.remotion/` | BSD-3-Clause（Chromium）；另附第三方元件的授權，見下載資料夾裡的 `LICENSE.headless_shell` | 可 | `@remotion/renderer` 用它畫出動畫卡片的每一格 | 2026-11-15 |
 
 ## 間接相依，以及允許清單以外、人工確認過的項目
 
@@ -59,7 +72,9 @@
 
 後半是人工確認過的項目：直接相依裡授權不在清單內的 numpy，以及套件隨附、metadata 看不到的動態函式庫。
 
-`uv run python scripts/third_party.py --check` 檢查每個已安裝的相依：授權在允許清單裡就通過，不在的必須有本節的一列，這一列「版本或來源」寫的版本等於已安裝的版本，而且「能否商業使用」是「可」。套件升級之後，版本對不上就不通過：要讀新版本的授權，確認之後再改那一列的版本。新增或升級套件之後要跑它。
+最後是 `scenes/package-lock.json` 裡授權不在允許清單上的 npm 套件，授權讀自這個檔案的 `license` 欄位。其餘的 npm 套件授權都在允許清單上，不列在這裡；`--table` 會印出全部。
+
+`uv run python scripts/third_party.py --check` 檢查每個已安裝的相依，Python 和 npm 套件都一樣：授權在允許清單裡就通過，不在的必須有本節的一列，這一列「版本或來源」寫的版本等於已安裝的版本，而且「能否商業使用」是「可」。套件升級之後，版本對不上就不通過：要讀新版本的授權，確認之後再改那一列的版本。新增或升級套件之後要跑它。
 
 | 名稱 | 版本或來源 | 授權 | 能否商業使用 | 用途 | 查核日期 |
 |---|---|---|---|---|---|
@@ -86,6 +101,18 @@
 | numpy | 2.5.4 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | 可 | 直接相依（見上方 Python 套件表），授權含允許清單以外的 CC0-1.0，人工確認 | 2026-11-11 |
 | libsndfile（soundfile 的 wheel 隨附） | soundfile 0.14.0 | LGPL-2.1 | 可 | soundfile 讀寫音訊時載入的動態函式庫，沒有修改 | 2026-11-11 |
 | FFmpeg 等動態函式庫（opencv-python-headless 的 wheel 隨附） | opencv-python-headless 5.0.0.93 | LGPL-2.1、LGPL-3.0 | 可 | opencv 讀影片時載入的動態函式庫，沒有修改 | 2026-11-11 |
+| remotion | 4.0.542 | Remotion License（套件內的 `LICENSE.md`） | 可（條件見下方） | 直接相依（見上方 npm 套件表） | 2026-11-15 |
+| @remotion/bundler | 4.0.542 | Remotion License（套件內的 `LICENSE.md`） | 可（條件見下方） | 直接相依（見上方 npm 套件表） | 2026-11-15 |
+| @remotion/renderer | 4.0.542 | Remotion License（套件內的 `LICENSE.md`） | 可（條件見下方） | 直接相依（見上方 npm 套件表） | 2026-11-15 |
+| @remotion/player | 4.0.542 | Remotion License（套件內的 `LICENSE.md`） | 可（條件見下方） | 由 @remotion/sdk、@remotion/studio 帶入 | 2026-11-15 |
+| @remotion/web-renderer | 4.0.542 | Remotion License（套件內的 `LICENSE.md`） | 可（條件見下方） | 由 @remotion/studio 帶入 | 2026-11-15 |
+| @remotion/sdk | 4.0.542 | Remotion License（package.json 的標示；套件內沒有授權檔） | 可（條件見下方） | 由 @remotion/studio 帶入 | 2026-11-15 |
+| @remotion/studio-protocol | 4.0.542 | Remotion License（package.json 的標示；套件內沒有授權檔） | 可（條件見下方） | 由 @remotion/codemods、@remotion/studio 帶入 | 2026-11-15 |
+| @remotion/effects | 4.0.542 | package.json 標示 UNLICENSED，套件內沒有 Remotion 的授權檔；視為 Remotion License。內附的 `THIRD_PARTY_LICENSES.md` 說明部分著色器改寫自 EffectCraft，MIT 授權 | 可（條件見下方） | 由 @remotion/studio 帶入 | 2026-11-15 |
+| @remotion/media | 4.0.542 | package.json 沒有標示，套件內沒有授權檔；視為 Remotion License | 可（條件見下方） | 由 @remotion/studio 帶入 | 2026-11-15 |
+| @remotion/compositor-darwin-arm64 | 4.0.542 | package.json 沒有標示，套件內沒有授權檔；視為 Remotion License。內附的 ffmpeg 是 GPL 版本 | 可（當工具用，見下方） | 由 @remotion/renderer 帶入：Remotion 執行的 ffmpeg 等程式，把畫好的每一格編成影片 | 2026-11-15 |
+| caniuse-lite | 1.0.30001826 | CC-BY-4.0 | 可 | 由 browserslist 帶入 | 2026-11-15 |
+| graceful-fs | 4.2.12 | BlueOak-1.0.0 | 可 | 由 enhanced-resolve、watchpack、webpack 帶入 | 2026-11-15 |
 
 ### 人工確認的依據
 
@@ -97,7 +124,18 @@
 - libsndfile：它的 GitHub 頁面標示 LGPL-2.1，soundfile 的 wheel 內附的授權檔（`COPYING`）也是 LGPL-2.1。
 - opencv-python-headless 隨附的函式庫：PyPI 頁面寫明每個 wheel 都帶 LGPL-2.1 的 FFmpeg；wheel 內的 `LICENSE-3RD-PARTY.txt` 列出這個 wheel 另外帶的函式庫，授權是 LGPL-2.1 或 LGPL-3.0。
 
+npm 套件和 Chrome Headless Shell 在 2026-11-15 讀過下載下來的檔案：
+
+- Remotion License：`remotion`、`@remotion/bundler`、`@remotion/renderer`、`@remotion/player`、`@remotion/web-renderer` 各附一份 `LICENSE.md`，五份內容相同。個人、員工 3 人以下的營利組織、非營利組織，可以免費用 Remotion 做影片和圖片，包含商業用途，也可以為了自己的用途修改它。員工超過 3 人的營利組織，要買 Remotion 的公司授權（Company License），價格見 <https://www.remotion.pro/license>。不可以複製或修改 Remotion 的程式碼，做成自己的版本販售、出租或再授權。
+- `@remotion/sdk`、`@remotion/studio-protocol`：package.json 標示 Remotion License，套件內沒有授權檔。
+- `@remotion/effects`（package.json 標示 UNLICENSED）、`@remotion/media` 和 `@remotion/compositor-darwin-arm64`（沒有標示）：套件內都沒有 Remotion 的授權檔。`@remotion/effects` 另附 `THIRD_PARTY_LICENSES.md`：Fractal Noise、Shatter、Film Burn、Magnify 等著色器改寫自 EffectCraft（<https://github.com/storytold/effectcraft>），MIT 授權，全文附在檔案裡；MIT 允許商業使用，條件是散布時附上授權全文，本專案不散布這個套件。三個套件 package.json 的 `repository` 都指向 Remotion 的儲存庫 `remotion-dev/remotion`，和上面的套件是同一個儲存庫，所以視為 Remotion License 涵蓋的套件。升級 Remotion 時要再確認一次：新版本多出沒有標示授權的套件，要另外決定。
+- `@remotion/compositor-darwin-arm64` 內附的 ffmpeg、ffprobe 和 FFmpeg 函式庫，編譯設定含 `--enable-gpl`、`--enable-libx264`、`--enable-libx265`、`--enable-libfdk-aac`。本專案只執行它們，不散布：`node_modules/` 不進 git，`npm ci` 從 npm 下載到使用者自己的電腦。輸出的影片不受 GPL 約束。
+- caniuse-lite 的 CC-BY-4.0：套件內的 `LICENSE` 是 Creative Commons 姓名標示 4.0 國際授權條款，沒有非商業的限制，可以複製、散布和改作，條件是標示出處。
+- graceful-fs 的 BlueOak-1.0.0：套件內的 `LICENSE.md` 是 Blue Oak Model License 1.0.0，允許做任何原本會侵害著作權的事；散布時要附上授權全文或連結。
+- Chrome Headless Shell：下載資料夾裡的 `LICENSE.headless_shell` 開頭是 Chromium 的 BSD-3-Clause 授權，後面是各個第三方元件的授權，包括 FFmpeg 的 LGPL-2.1。全文沒有限制商業使用的條款。
+
 ### 沒有列進來的套件
 
 - `colorama` 和 `httpx2-jsfetch`：`uv.lock` 的條件讓它們只在 Windows 和 WebAssembly 環境安裝，本機不裝。
 - 開發群組（pytest 和它的相依）只在跑測試時用，`--check` 不檢查它們。
+- `scenes/package-lock.json` 裡標成 optional、給其他平台用的 npm 套件，例如其他平台的 `@remotion/compositor-*` 和 `@rspack/binding-*`：本機不裝，`--check` 把它們列成 note，不檢查。

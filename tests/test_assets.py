@@ -278,6 +278,12 @@ def test_hf_model_present_when_complete(tmp_path):
     assert hf_model_present(tmp_path, "Qwen/Qwen3-ASR-0.6B") is False  # a different model is not this one
 
 
+def remotion_present(monkeypatch):
+    """Report node, the Remotion modules and their browser as there, so a baseline needs only this module's items."""
+    items = {"node": "/opt/node/bin/node", "remotion": True, "remotion_browser": True}
+    monkeypatch.setattr("pipeline.scene_render.doctor_items", lambda: (items, []))
+
+
 def test_doctor_asr_models_follow_hf_home(tmp_path, monkeypatch):
     hf = tmp_path / "hf"
     fake_hf_model(hf / "hub", HF_MODELS[0])
@@ -291,6 +297,7 @@ def test_doctor_asr_models_follow_hf_home(tmp_path, monkeypatch):
 def test_doctor_missing_aligner_makes_ok_false(tmp_path, monkeypatch):
     require_assets()  # the baseline needs the real fonts and face model
     monkeypatch.setattr(assets, "_free_gb", lambda: 100.0)
+    remotion_present(monkeypatch)
     with_aligner, without_aligner = tmp_path / "with_aligner", tmp_path / "without_aligner"
     for hf, names in ((with_aligner, HF_MODELS), (without_aligner, HF_MODELS[:2])):
         for name in names:
@@ -330,12 +337,14 @@ def test_doctor_uses_nearest_existing_parent_of_studio(tmp_path, monkeypatch):
 def test_doctor_reports_every_item_the_cli_documents():
     report = doctor()
     assert {"ok", "ffmpeg", "libass", "h264_videotoolbox", "hevc_videotoolbox", "fonts", "yunet",
-            "caption_dictionary", "asr_cli", "asr_models", "free_gb", "warnings"} <= set(report)
+            "caption_dictionary", "asr_cli", "asr_models", "node", "remotion", "remotion_browser", "free_gb",
+            "warnings"} <= set(report)
 
 
 def test_doctor_without_the_caption_dictionary_is_not_ok(tmp_path, monkeypatch):
     require_assets()  # the baseline needs the real fonts, face model and dictionary
     monkeypatch.setattr(assets, "_free_gb", lambda: 100.0)
+    remotion_present(monkeypatch)
     for name in HF_MODELS:
         fake_hf_model(tmp_path / "hf" / "hub", name)
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))

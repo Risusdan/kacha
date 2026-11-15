@@ -36,6 +36,7 @@ from pipeline.project import (
 )
 from pipeline.render import render
 from pipeline.review_server import ReviewServer, serve_review
+from pipeline.scene_render import setup_scenes
 from pipeline.storyboard import build_storyboard
 from pipeline.trim import trim
 
@@ -225,7 +226,8 @@ def _setup(args: argparse.Namespace) -> dict:
     fonts = setup_fonts(fonts_dir())
     model = setup_models(models_dir())
     dictionary = setup_dictionary(models_dir())
-    return {"fonts": [str(path) for path in fonts], "yunet": str(model), "dictionary": str(dictionary)}
+    remotion = setup_scenes()
+    return {"fonts": [str(path) for path in fonts], "yunet": str(model), "dictionary": str(dictionary), **remotion}
 
 
 @command("doctor")

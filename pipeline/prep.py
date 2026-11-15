@@ -1,8 +1,8 @@
 """Prep: what the later steps read from a source video.
 
 Writes work/probe.json, work/audio48k.wav (stereo, for the render), work/audio16k.wav (mono, for
-speech recognition), work/faces.json (the face boxes the phase 2 zoom will aim at) and, for HDR
-sources only, work/video.mp4 (an SDR copy). Both wavs start at the first video frame and last as
+speech recognition), work/faces.json (the face boxes the punch-in of the render is anchored on, see
+pipeline.punch) and, for HDR sources only, work/video.mp4 (an SDR copy). Both wavs start at the first video frame and last as
 long as the video stream, so a time in a wav is the same time in the video.
 """
 

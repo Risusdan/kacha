@@ -19,6 +19,7 @@ from helpers import (
 )
 
 from pipeline import project as project_module
+from pipeline import punch
 from pipeline.captions import build_events, caption_top_px
 from pipeline.edit import (
     NOTE_PREFIX,
@@ -244,7 +245,7 @@ def test_the_mode_is_the_caption_mode_of_the_edit(tmp_path):
 
 
 def test_captions_are_build_events_on_the_reel(tmp_path):
-    transcript, trims = transcript_and_trims("今天，我們來聊剪輯。第二句話。", "今天我們嗯來聊剪輯第二句話")
+    transcript, trims = transcript_and_trims("今天、我們來聊剪輯。第二句話。", "今天我們嗯來聊剪輯第二句話")
     p = project_for(tmp_path, transcript, trims)
     edit, _, _ = require_valid(p)
     style = load_style(edit["style"])
@@ -257,7 +258,7 @@ def test_captions_are_build_events_on_the_reel(tmp_path):
     assert [[piece["t"] for piece in c["pieces"]] for c in data["captions"]] == [
         [None if t is None else round(t, 3) for t in event.times] for event in events
     ]
-    assert any(piece["t"] is None for c in data["captions"] for piece in c["pieces"])  # the comma has no time
+    assert any(piece["t"] is None for c in data["captions"] for piece in c["pieces"])  # the 、 has no time
 
 
 def test_the_caption_style_is_the_style_of_the_edit(tmp_path):
@@ -654,3 +655,54 @@ def test_page_data_holds_nothing_but_json_values(tmp_path):
     for sentence in data["sentences"]:
         for key in ("start", "end"):
             assert sentence[key] == round(sentence[key], 3)
+
+
+# ---- the punch-in -----------------------------------------------------------------------------------
+
+
+def test_shots_are_the_punch_in_of_every_segment_in_source_time(tmp_path):
+    """Each segment with its scale and its anchor (0-1 of the 9:16 picture the review video shows), from edit.json
+    and faces.json as the render frames them; times rounded to the millisecond, anchors to 4 places."""
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。第二句話。", "今天我們嗯來聊剪輯第二句話")
+    p = project_for(tmp_path, transcript, trims)
+    faces = {"boxes": [{"t": 0.5, "x0": 0.1, "y0": 0.2, "x1": 0.3, "y1": 0.4, "score": 0.9}]}
+    (p.work / "faces.json").write_text(json.dumps(faces), encoding="utf-8")
+    edit, _, _ = require_valid(p)
+    shots = punch.shots(edit, transcript, trims, faces, {"display_w": 1080, "display_h": 1920})
+    assert [s.scale for s in shots] == [1.0, 1.0]  # the accepted filler is a cut point; nothing is punched in
+    data = page_data(p)
+    assert data["shots"] == [[0.0, round(shots[0].end, 3), 1.0, 0.2, 0.3],
+                             [round(shots[1].start, 3), round(shots[1].end, 3), 1.0, 0.2, 0.3]]
+    assert [shot[:2] for shot in data["shots"]] == data["segments"]
+    edit["punch_in"] = {"s01": 1.1}  # both shots start in the first sentence
+    p.edit_path.write_text(json.dumps(edit, ensure_ascii=False), encoding="utf-8")
+    validate_project(p)
+    assert [shot[2] for shot in page_data(p)["shots"]] == [1.1, 1.1]
+
+
+# ---- the animation cards ----------------------------------------------------------------------------
+
+
+def test_scenes_are_the_scenes_that_show_with_their_source_times_and_the_label_the_player_shows(tmp_path):
+    """A scene from the first character of the second sentence to its end, in source time as the player reads it;
+    the scene of the first sentence, which cuts.extra removes, does not show."""
+    transcript, trims = transcript_and_trims(
+        "今天我們來聊剪輯。第二句話。", [("今天我們", 0.0, 0.8), ("來聊剪輯", 2.0, 2.8), ("第二句話", 3.0, 3.8)]
+    )
+    edit = default_edit(transcript, trims)
+    edit["scenes"] = [
+        {"id": "sc1", "card": "keyword-pop", "at": {"s": "s01", "char": 0}, "until": {"s": "s01", "end": True},
+         "params": {"text": "剪輯"}},
+        {"id": "sc2", "card": "number-slab", "at": {"s": "s02", "char": 0}, "until": {"s": "s02", "end": True},
+         "params": {"value": "兩小時", "label": "一天多撐"}},
+    ]
+    remove(edit, "s01", "離題")
+    data = page_data(project_for(tmp_path, transcript, trims, edit))
+    units = transcript["sentences"][1]["units"]
+    assert data["scenes"] == [{"start": round(units[0]["start"], 3), "end": round(units[-1]["end"], 3),
+                               "label": "動畫：數字卡　兩小時／一天多撐"}]
+
+
+def test_a_reel_without_scenes_has_none(tmp_path):
+    transcript, trims = transcript_and_trims("今天我們來聊剪輯。", [("今天我們來聊剪輯", 0.0, 1.6)])
+    assert page_data(project_for(tmp_path, transcript, trims))["scenes"] == []

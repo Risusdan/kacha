@@ -90,6 +90,25 @@ export function seekPoint(t, segments) {
   return Math.max(t, start + SEAM_S);
 }
 
+// The punch-in of the frame at source time `t`: for the shot that holds it (GET /api/data's "shots", [start, end,
+// scale, ax, ay] in source seconds, the anchor in 0-1 of the picture), the CSS transform and transform-origin that
+// scale the video about the anchor, so that the anchor stays where it is on screen, as the render frames the shot;
+// null at the base framing (scale 1) and when there are no shots. A time in a cut, which the player skips, or
+// before the first shot takes the shot the player goes to (the first that ends after `t`), so that no frame on the
+// way shows another framing; a time at or after the end of the reel takes the last shot, where the player stops.
+export function shotTransform(t, shots) {
+  const shot = shots.find(([, end]) => t < end) ?? shots[shots.length - 1];
+  if (!shot || shot[2] === 1) return null;
+  const percent = (value) => `${+(value * 100).toFixed(2)}%`;
+  return { transform: `scale(${shot[2]})`, origin: `${percent(shot[3])} ${percent(shot[4])}` };
+}
+
+// The animation card that plays at source time `t`: the scene of GET /api/data's "scenes" ({start, end, label} in
+// source seconds) whose span holds it (start <= t < end), or null.
+export function sceneAt(t, scenes) {
+  return scenes.find((scene) => scene.start <= t && t < scene.end) ?? null;
+}
+
 // The caption on screen at reel time `r` (start <= r < end), or null.
 export function captionAt(r, captions) {
   return captions.find((caption) => caption.start <= r && r < caption.end) ?? null;

@@ -1461,9 +1461,9 @@ def _set_document_version(path, version):
 
 
 def test_format_versions_name_the_steps_that_have_one():
-    """transcribe and trim for the format of their files; render for what it does to the sound (version 2 treats
-    the voice, see pipeline.voice)."""
-    assert FORMAT_VERSIONS == {"transcribe": 2, "trim": 2, "render": 2}
+    """transcribe and trim for the format of their files; render for what it does to the sound and the picture
+    (version 2 treats the voice, see pipeline.voice; version 3 punches in, see pipeline.punch)."""
+    assert FORMAT_VERSIONS == {"transcribe": 2, "trim": 2, "render": 3}
 
 
 def test_a_step_record_without_the_current_format_version_is_not_done(transcribed_project):

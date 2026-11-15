@@ -17,6 +17,8 @@ import {
   litPieces,
   nearestUnit,
   pageState,
+  shotTransform,
+  sceneAt,
   placePopover,
   playerClock,
   pollVersion,
@@ -411,4 +413,37 @@ test("pageState takes the state, step, outputs and error text from the state key
   assert.deepEqual(pageState(done), { state: "done", step: null, outputs, failedText: null });
   // keys the answer does not have are null, never undefined
   assert.deepEqual(pageState({ state: "editing" }), { state: "editing", step: null, outputs: null, failedText: null });
+});
+
+
+test("shotTransform scales the picture about the anchor of the shot that plays; nothing at the base framing", () => {
+  const shots = [[0, 2, 1, 0.5, 0.5], [3, 5, 1.1, 0.2, 0.43], [5, 6, 1.2, 0.18, 0.4]];
+  const second = { transform: "scale(1.1)", origin: "20% 43%" };
+  const last = { transform: "scale(1.2)", origin: "18% 40%" };
+  assert.equal(shotTransform(1, shots), null); // the base framing
+  assert.deepEqual(shotTransform(3, shots), second);
+  assert.deepEqual(shotTransform(4.99, shots), second);
+  assert.deepEqual(shotTransform(5, shots), last); // the next shot from its start
+  // in a cut, which the player is skipping, and before the first shot: the shot it goes to, so that no frame on
+  // the way shows another framing
+  assert.deepEqual(shotTransform(2.5, shots), second);
+  assert.deepEqual(shotTransform(3 - SEAM_S / 2, shots), second);
+  assert.deepEqual(shotTransform(-1, [[1, 2, 1.1, 0.5, 0.5]]), { transform: "scale(1.1)", origin: "50% 50%" });
+  // at and after the end of the reel: the last shot, where the player stops
+  assert.deepEqual(shotTransform(6, shots), last);
+  assert.deepEqual(shotTransform(60, shots), last);
+  assert.equal(shotTransform(1, []), null);
+});
+
+test("sceneAt is the scene whose source span holds the time, from its start up to its end", () => {
+  const first = { start: 2, end: 4.5, label: "動畫：數字卡　兩小時／一天多撐" };
+  const second = { start: 6, end: 8, label: "動畫：重點字　省電" };
+  const scenes = [first, second];
+  assert.equal(sceneAt(1.99, scenes), null);
+  assert.equal(sceneAt(2, scenes), first);
+  assert.equal(sceneAt(4.49, scenes), first);
+  assert.equal(sceneAt(4.5, scenes), null);
+  assert.equal(sceneAt(7, scenes), second);
+  assert.equal(sceneAt(8, scenes), null);
+  assert.equal(sceneAt(3, []), null);
 });

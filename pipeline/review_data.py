@@ -1,5 +1,9 @@
 """What the review page shows: page_data(p) is the document the page loads, built from edit.json, transcript.json,
-trim.json and probe.json as the storyboard reads them.
+trim.json and probe.json as the storyboard reads them, and faces.json for the punch-in: shots holds, for each segment,
+[start, end, scale, ax, ay] (punch.shots: the anchor in 0-1 of the 9:16 picture the review video shows, rounded to 4
+places), which the page shows by scaling the video about the anchor as it plays. scenes holds, for each animation
+card that shows (scenes.scene_layout), its source start and end and the label the player shows over the video while it
+plays ("動畫：數字卡　兩小時／一天多撐"); the page does not change scenes.
 
 page_data refuses with NotReady while edit.json has not passed validate on the files as they are now (or while
 require_valid refuses it): Claude is changing it, and the page tries again later. The version (edit_version) is a
@@ -38,6 +42,8 @@ cuts is the number of cuts the storyboard counts: the accepted candidates in the
 import hashlib
 import json
 
+from pipeline import punch
+from pipeline.scenes import scene_label, scene_layout
 from pipeline.captions import build_events, caption_source, caption_top_px
 from pipeline.edit import (
     Segment,
@@ -161,7 +167,8 @@ def page_data(p: Project) -> dict:
         edit, transcript, trims = require_valid(p)
     except PipelineError as error:
         raise NotReady() from error
-    probe = load_document(p.work / "probe.json", "prep", ("duration_s",))
+    probe = load_document(p.work / "probe.json", "prep", ("duration_s", "display_w", "display_h"))
+    faces = load_document(p.work / "faces.json", "prep", ("boxes",))
     style = load_style(edit["style"])
     caps = style["captions"]
     segments = build_segments(edit, transcript, trims)
@@ -242,6 +249,11 @@ def page_data(p: Project) -> dict:
         "duration_s": _seconds(total_duration(segments)),
         "duration_clock": clock(total_duration(segments)),
         "segments": [[_seconds(segment.start), _seconds(segment.end)] for segment in segments],
+        "shots": [[_seconds(shot.start), _seconds(shot.end), shot.scale, round(shot.ax, 4), round(shot.ay, 4)]
+                  for shot in punch.shots(edit, transcript, trims, faces, probe)],
+        "scenes": [{"start": _seconds(item.source_start), "end": _seconds(item.source_end),
+                    "label": "動畫：" + "　".join(scene_label(item.scene))}
+                   for item in scene_layout(edit, transcript, trims) if item.gone is None and item.frames > 0],
         "captions": [
             {"start": _seconds(event.start), "end": _seconds(event.end),
              "pieces": [{"text": piece.text, "t": _seconds(t)} for piece, t in zip(event.line.pieces, event.times)]}

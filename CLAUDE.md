@@ -1,6 +1,6 @@
 # kacha
 
-這個 repo 把手機直拍的口播影片剪成 Instagram Reels。`pipeline` 指令負責前處理、轉錄、粗剪、字幕和輸出；Claude 當導演，依使用者的意見寫 `edit.json`。本期（第 1 期）的成果是一支有字幕的順剪 mp4，放在專案的 `out/final.mp4`。
+這個 repo 把手機直拍的口播影片剪成 Instagram Reels。`pipeline` 指令負責前處理、轉錄、粗剪、字幕和輸出；Claude 當導演，依使用者的意見寫 `edit.json`。第 1 期的成果是一支有字幕的順剪 mp4，放在專案的 `out/final.mp4`。第 2 期進行中：已經有推近（預設不推近，只在使用者指定的地方放大）和三張動畫卡片（重點字、數字卡、清單，用 Remotion 渲染，只加在使用者要的地方），寫法都見 `storyboard` skill。其他的卡、B-roll 還沒有。
 
 使用者資料在 `studio/`（不進 git）：`inbox/` 放素材，`brand/` 放偏好，`projects/<日期-代稱>/` 每支影片一個資料夾。`studio/` 的位置由環境變數 `REELS_STUDIO` 決定，沒設就是 repo 底下的 `studio/`。
 
@@ -48,8 +48,8 @@
 
 ## 開發
 
-- 環境：`uv sync`。第一次用先跑 `uv run pipeline setup`（下載字幕字型、臉部偵測模型和斷詞字典；斷詞字典是字幕斷行找詞的邊界用的詞表），`uv run pipeline doctor` 會列出缺什麼。
+- 環境：`uv sync`，另外要有 Node.js 18.18 以上（渲染動畫卡片用）。第一次用先跑 `uv run pipeline setup`（下載字幕字型、臉部偵測模型和斷詞字典；斷詞字典是字幕斷行找詞的邊界用的詞表。也在 `scenes/` 跑 `npm ci`、下載 Remotion 渲染用的瀏覽器），`uv run pipeline doctor` 會列出缺什麼。
 - 測試：`uv run pytest`。標了 `slow` 的測試會跑真的語音辨識，預設跳過，`uv run pytest -m slow` 才跑。行為的改動先寫會失敗的測試，再寫程式。
 - 遞迴刪除一律經過 `pipeline.safe_delete` 的 `safe_rmtree`，刪除只發生在專案資料夾內。
 - 第三方的程式庫、模型和字型都必須能商業使用。新增或升級套件之後，跑 `uv run python scripts/third_party.py --check`，並更新 `THIRD_PARTY.md`。任何一項不能商業使用，或查不出授權，停下來問使用者，不自己決定。
-- 設計文件：`docs/superpowers/specs/2026-11-11-reels-workflow-design.md`、第 1 期改版 `docs/superpowers/specs/2026-11-12-phase1-revision-design.md`、互動審閱頁 `docs/superpowers/specs/2026-11-12-interactive-review-design.md`；實測紀錄：`docs/spikes/2026-11-11-phase0-results.md`。
+- 設計文件：`docs/superpowers/specs/2026-11-11-reels-workflow-design.md`、第 1 期改版 `docs/superpowers/specs/2026-11-12-phase1-revision-design.md`、互動審閱頁 `docs/superpowers/specs/2026-11-12-interactive-review-design.md`、推近 `docs/superpowers/specs/2026-11-15-punch-in-design.md`、動畫地基 `docs/superpowers/specs/2026-11-15-remotion-foundation-design.md`；實測紀錄：`docs/spikes/2026-11-11-phase0-results.md`。
